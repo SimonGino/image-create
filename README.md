@@ -91,8 +91,8 @@ above the abstraction changes.
 - **In-app Settings** — a page to write keys / base URLs to
   `~/.image-create/config.json` (SPEC §5); today they come from `.env` / that
   file directly.
-- **Confirm Gemini model IDs** — only `gpt-image-2` and
-  `gemini-3.1-flash-image-preview` are confirmed on the current relay; the
-  `gemini-3-pro-image` / `-flash-lite-image` IDs may differ per endpoint.
+- **Confirm the flash-lite id** — `gpt-image-2`, `gemini-3-pro-image-preview`,
+  and `gemini-3.1-flash-image-preview` are verified on the current relay; the
+  `gemini-3.1-flash-lite-image` id is still unconfirmed and may differ.
 - **Mask editing** (OpenAI) and **shadcn/ui** polish — supported by the
   abstraction / stack but not surfaced in the UI yet.
