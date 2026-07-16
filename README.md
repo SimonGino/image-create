@@ -19,6 +19,9 @@ Design spec: [SPEC.md](SPEC.md).
   cumulative usage by provider / model / month
 - **Gallery** — thumbnail grid with filters, detail view, delete
 - **Prompt templates / favorites** — save, apply (with default model), favorite
+- **Iterative editing** — send any result/gallery image back in as a reference
+- **Multi-model compare** — one prompt across several models, side by side
+- **In-app Settings** — manage per-provider keys + base URLs (writes config.json)
 
 ## Stack
 
@@ -88,9 +91,6 @@ above the abstraction changes.
 ## Optional follow-ups
 
 - **Production build check** — `npm run build` once (verifies deployability).
-- **In-app Settings** — a page to write keys / base URLs to
-  `~/.image-create/config.json` (SPEC §5); today they come from `.env` / that
-  file directly.
 - **Confirm the flash-lite id** — `gpt-image-2`, `gemini-3-pro-image-preview`,
   and `gemini-3.1-flash-image-preview` are verified on the current relay; the
   `gemini-3.1-flash-lite-image` id is still unconfirmed and may differ.
