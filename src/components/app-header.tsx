@@ -48,6 +48,12 @@ export function AppHeader({ providers }: { providers: ProviderStatus[] }) {
       <div className="flex items-center gap-3">
         {/* USAGE_CHIP_SLOT — the cumulative-usage chip mounts here */}
         <UsageChip />
+        <Link
+          href="/settings"
+          className="rounded-md px-2 py-1 text-sm text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-200"
+        >
+          设置
+        </Link>
         <div className="flex gap-2 text-xs">
           {providers.map((p) => (
             <span
