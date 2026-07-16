@@ -57,6 +57,11 @@ interface ApiError {
   issues?: { path?: string; code: string; message: string }[];
 }
 
+/** A reference-image input: an uploaded file, or a URL to an already-generated image. */
+type RefInput =
+  | { id: string; kind: "file"; file: File; previewUrl: string }
+  | { id: string; kind: "url"; url: string };
+
 /** stored path is "data/images/{id}/{file}"; the media route serves under images/. */
 function mediaUrl(filePath: string): string {
   return "/api/images/" + filePath.replace(/^data\/images\//, "");
@@ -66,8 +71,8 @@ function fmtUsd(v: number | undefined): string {
   return v === undefined ? "—" : `$${v.toFixed(3)}`;
 }
 
-async function fileToBase64(file: File): Promise<string> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
   let binary = "";
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
@@ -75,6 +80,9 @@ async function fileToBase64(file: File): Promise<string> {
   }
   return btoa(binary);
 }
+
+/** sessionStorage key for handing a gallery image to the console as a reference. */
+const PENDING_REF_KEY = "imageCreate:pendingRef";
 
 function labelClass() {
   return "block text-xs font-medium text-neutral-500 mb-1";
@@ -108,7 +116,7 @@ export function Console({ models, providers }: ConsoleProps) {
   }, [availableModels, modelId]);
 
   const [prompt, setPrompt] = useState("");
-  const [refFiles, setRefFiles] = useState<File[]>([]);
+  const [refInputs, setRefInputs] = useState<RefInput[]>([]);
 
   // Size + params (reset when the model changes, in the effect below).
   const [pixelSize, setPixelSize] = useState("1024x1024");
@@ -192,8 +200,19 @@ export function Console({ models, providers }: ConsoleProps) {
   // Reset the selected preview whenever a new batch arrives.
   useEffect(() => setSelectedIdx(0), [result]);
 
+  // Pick up an image handed over from the gallery ("用作参考图").
+  useEffect(() => {
+    const pending = sessionStorage.getItem(PENDING_REF_KEY);
+    if (pending) {
+      sessionStorage.removeItem(PENDING_REF_KEY);
+      setMode("reference");
+      addRefUrl(pending);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const canGenerate = Boolean(model && request && prompt.trim() && !loading &&
-    (mode !== "reference" || refFiles.length > 0));
+    (mode !== "reference" || refInputs.length > 0));
 
   async function generate() {
     if (!model || !request) return;
@@ -208,7 +227,13 @@ export function Console({ models, providers }: ConsoleProps) {
       const refImages =
         mode === "reference"
           ? await Promise.all(
-              refFiles.map(async (f) => ({ data: await fileToBase64(f), mimeType: f.type || "image/png" })),
+              refInputs.map(async (r) => {
+                if (r.kind === "file") {
+                  return { data: await blobToBase64(r.file), mimeType: r.file.type || "image/png" };
+                }
+                const blob = await (await fetch(r.url)).blob();
+                return { data: await blobToBase64(blob), mimeType: blob.type || "image/png" };
+              }),
             )
           : undefined;
 
@@ -267,6 +292,41 @@ export function Console({ models, providers }: ConsoleProps) {
     if (t.defaultModelId && availableModels.some((m) => m.id === t.defaultModelId)) {
       setModelId(t.defaultModelId);
     }
+  }
+
+  function addRefFiles(files: File[]) {
+    if (files.length === 0) return;
+    setRefInputs((prev) => [
+      ...prev,
+      ...files.map((file) => ({
+        id: crypto.randomUUID(),
+        kind: "file" as const,
+        file,
+        previewUrl: URL.createObjectURL(file),
+      })),
+    ]);
+  }
+
+  function addRefUrl(url: string) {
+    setRefInputs((prev) =>
+      prev.some((r) => r.kind === "url" && r.url === url)
+        ? prev
+        : [...prev, { id: crypto.randomUUID(), kind: "url" as const, url }],
+    );
+  }
+
+  function removeRef(id: string) {
+    setRefInputs((prev) => {
+      const target = prev.find((r) => r.id === id);
+      if (target?.kind === "file") URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((r) => r.id !== id);
+    });
+  }
+
+  // Feed a generated image back in as a reference, and switch to reference mode.
+  function useAsReference(img: GenImage) {
+    addRefUrl(mediaUrl(img.filePath));
+    setMode("reference");
   }
 
   const caps = model?.capabilities;
@@ -338,16 +398,39 @@ export function Console({ models, providers }: ConsoleProps) {
         {mode === "reference" && (
           <div>
             <span className={labelClass()}>参考图（≤{caps?.maxRefImages ?? 1}）</span>
+            {refInputs.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {refInputs.map((r) => (
+                  <div key={r.id} className="relative">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={r.kind === "file" ? r.previewUrl : r.url}
+                      alt="参考图"
+                      className="h-14 w-14 rounded-md border border-neutral-200 object-cover dark:border-neutral-700"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeRef(r.id)}
+                      aria-label="移除参考图"
+                      className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-neutral-900 text-[10px] leading-none text-white dark:bg-white dark:text-neutral-900"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <input
               type="file"
               accept="image/*"
               multiple
-              onChange={(e) => setRefFiles(Array.from(e.target.files ?? []))}
+              onChange={(e) => {
+                addRefFiles(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
               className="block w-full text-xs text-neutral-500 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-100 file:px-3 file:py-1.5 file:text-sm dark:file:bg-neutral-800"
             />
-            {refFiles.length > 0 && (
-              <p className="mt-1 text-xs text-neutral-400">已选 {refFiles.length} 张</p>
-            )}
+            <p className="mt-1 text-xs text-neutral-400">上传,或用下方生成结果的「用作参考图」</p>
           </div>
         )}
 
@@ -552,6 +635,12 @@ export function Console({ models, providers }: ConsoleProps) {
                 className="rounded-lg border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
               >
                 下载
+              </button>
+              <button
+                onClick={() => useAsReference(currentImage)}
+                className="rounded-lg border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
+              >
+                用作参考图
               </button>
               <button
                 onClick={generate}

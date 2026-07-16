@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { useRouter } from "next/navigation";
+
 import type { ProviderId, SizeSpec } from "@/providers/types";
 
 // ---- API shapes (mirrors /api/generations + /api/generations/[id]) ----
@@ -95,6 +97,9 @@ async function downloadImage(filePath: string, filename: string): Promise<void> 
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+// Must match console.tsx: hands a gallery image to the console as a reference.
+const PENDING_REF_KEY = "imageCreate:pendingRef";
 
 const labelClass = "block text-xs font-medium text-neutral-500 mb-1";
 const controlClass =
@@ -340,8 +345,14 @@ function DetailView({
   deleting: boolean;
   onDelete: () => void;
 }) {
+  const router = useRouter();
   const params = detail.providerParams;
   const hasParams = params && Object.keys(params).length > 0;
+
+  function useAsRef(filePath: string) {
+    sessionStorage.setItem(PENDING_REF_KEY, mediaUrl(filePath));
+    router.push("/");
+  }
 
   return (
     <div className="space-y-4 pr-6">
@@ -360,17 +371,25 @@ function DetailView({
                 <span>
                   {img.width ?? "?"}×{img.height ?? "?"}
                 </span>
-                <button
-                  onClick={() =>
-                    void downloadImage(
-                      img.filePath,
-                      `${detail.id.slice(0, 8)}-${img.idx}.${(img.filePath.split(".").pop() ?? "png").toLowerCase()}`,
-                    )
-                  }
-                  className="rounded-md border border-neutral-300 px-2 py-1 font-medium text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                >
-                  下载
-                </button>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => useAsRef(img.filePath)}
+                    className="rounded-md border border-neutral-300 px-2 py-1 font-medium text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    用作参考图
+                  </button>
+                  <button
+                    onClick={() =>
+                      void downloadImage(
+                        img.filePath,
+                        `${detail.id.slice(0, 8)}-${img.idx}.${(img.filePath.split(".").pop() ?? "png").toLowerCase()}`,
+                      )
+                    }
+                    className="rounded-md border border-neutral-300 px-2 py-1 font-medium text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    下载
+                  </button>
+                </div>
               </div>
             </div>
           ))}
