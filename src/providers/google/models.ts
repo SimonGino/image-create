@@ -1,14 +1,17 @@
 /**
- * Google Gemini image model metadata (SPEC §8, api-facts §1).
+ * Google Gemini image model metadata (SPEC §8).
  *
  * Size is ratio-based (aspect_ratio + image_size). No native multi-image: these
  * models produce ONE image per call, so "n images" is done by the orchestration
  * layer firing N concurrent generate() calls (supportsN=false / maxN=1).
  *
- * ⚠️ Pricing is PROVISIONAL — Gemini per-image / per-token rates were left as a
- * pre-launch follow-up in the design (SPEC §8: "落地前以官方为准"). imageOutputPerMTok
- * below is a placeholder so actual cost can be computed from returned tokens;
- * no static estimate table until the numbers are confirmed.
+ * Pricing is OFFICIAL (verified 2026-07-16):
+ *   - ai.google.dev/gemini-api/docs/pricing
+ *   - cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
+ * Image OUTPUT token rates: 3-pro=$120/1M, 3.1-flash=$60/1M, 3.1-flash-lite=$30/1M.
+ * INPUT tokens (text + image) bill at ~$2/1M. `perImageTable` holds the official
+ * per-image $ by resolution tier (drives the pre-flight estimate); actual cost is
+ * recomputed from returned usage tokens.
  */
 
 import type { AspectRatio, ImageSizeTier, ModelDescriptor, OutputFormat } from "../types";
@@ -29,17 +32,13 @@ const ALL_ASPECT_RATIOS: AspectRatio[] = [
 // Gemini returns PNG (with a mandatory SynthID watermark, api-facts §8).
 const OUTPUT_FORMATS: OutputFormat[] = ["png"];
 
-const PRICING_TODO =
-  "Pricing provisional — confirm official Gemini rates before launch (SPEC §8).";
-
-const HIGH_RES_TIERS: ImageSizeTier[] = ["1K", "2K", "4K"];
+const INPUT_PER_MTOK = 2; // text + image input, ~$2/1M
 
 export const GOOGLE_MODELS: ModelDescriptor[] = [
   {
     id: "gemini-3-pro-image",
     providerId: "google",
     label: "Gemini 3 Pro Image (Nano Banana Pro)",
-    note: PRICING_TODO,
     capabilities: {
       modes: ["t2i", "reference"],
       maxRefImages: 14, // api-facts §1
@@ -48,13 +47,15 @@ export const GOOGLE_MODELS: ModelDescriptor[] = [
       maxN: 1,
       sizeSpecKind: "ratio",
       aspectRatios: ALL_ASPECT_RATIOS,
-      imageSizeTiers: HIGH_RES_TIERS,
+      imageSizeTiers: ["1K", "2K", "4K"] as ImageSizeTier[],
       outputFormats: OUTPUT_FORMATS,
     },
     pricing: {
       unit: "token",
-      imageOutputPerMTok: 120, // PROVISIONAL
-      derived: true,
+      imageOutputPerMTok: 120, // 1120 tok → $0.134
+      imageInputPerMTok: INPUT_PER_MTOK,
+      textInputPerMTok: INPUT_PER_MTOK,
+      perImageTable: { "1K": 0.134, "2K": 0.134, "4K": 0.24 },
     },
   },
   {
@@ -62,7 +63,6 @@ export const GOOGLE_MODELS: ModelDescriptor[] = [
     id: "gemini-3.1-flash-image-preview",
     providerId: "google",
     label: "Gemini 3.1 Flash Image (Nano Banana 2)",
-    note: PRICING_TODO,
     capabilities: {
       modes: ["t2i", "reference"],
       maxRefImages: 14,
@@ -71,20 +71,21 @@ export const GOOGLE_MODELS: ModelDescriptor[] = [
       maxN: 1,
       sizeSpecKind: "ratio",
       aspectRatios: ALL_ASPECT_RATIOS,
-      imageSizeTiers: HIGH_RES_TIERS,
+      imageSizeTiers: ["0.5K", "1K", "2K", "4K"] as ImageSizeTier[],
       outputFormats: OUTPUT_FORMATS,
     },
     pricing: {
       unit: "token",
-      imageOutputPerMTok: 30, // PROVISIONAL
-      derived: true,
+      imageOutputPerMTok: 60, // 1120 tok (1K) → $0.067
+      imageInputPerMTok: INPUT_PER_MTOK,
+      textInputPerMTok: INPUT_PER_MTOK,
+      perImageTable: { "0.5K": 0.045, "1K": 0.067, "2K": 0.101, "4K": 0.151 },
     },
   },
   {
     id: "gemini-3.1-flash-lite-image",
     providerId: "google",
     label: "Gemini 3.1 Flash Lite Image",
-    note: PRICING_TODO,
     capabilities: {
       modes: ["t2i", "reference"],
       maxRefImages: 6,
@@ -93,13 +94,15 @@ export const GOOGLE_MODELS: ModelDescriptor[] = [
       maxN: 1,
       sizeSpecKind: "ratio",
       aspectRatios: ALL_ASPECT_RATIOS,
-      imageSizeTiers: ["1K"], // 1K only (SPEC §8)
+      imageSizeTiers: ["1K"] as ImageSizeTier[], // 1K only
       outputFormats: OUTPUT_FORMATS,
     },
     pricing: {
       unit: "token",
-      imageOutputPerMTok: 20, // PROVISIONAL
-      derived: true,
+      imageOutputPerMTok: 30, // 1120 tok → $0.034
+      imageInputPerMTok: INPUT_PER_MTOK,
+      textInputPerMTok: INPUT_PER_MTOK,
+      perImageTable: { "1K": 0.034 },
     },
   },
 ];

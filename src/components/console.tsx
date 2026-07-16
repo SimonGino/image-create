@@ -15,6 +15,7 @@ import type {
   Quality,
   SizeSpec,
 } from "@/providers/types";
+import { TemplateBar, type PromptTemplate } from "@/components/template-bar";
 
 // Client-side ceiling for Gemini-style fan-out (mirrors MAX_FANOUT_N in the adapter).
 const MAX_FANOUT_N = 8;
@@ -260,6 +261,14 @@ export function Console({ models, providers }: ConsoleProps) {
     }
   }
 
+  // Fill the prompt (and default model, if usable in the current mode) from a template.
+  function applyTemplate(t: PromptTemplate) {
+    setPrompt(t.body);
+    if (t.defaultModelId && availableModels.some((m) => m.id === t.defaultModelId)) {
+      setModelId(t.defaultModelId);
+    }
+  }
+
   const caps = model?.capabilities;
   const currentImage = result?.images[selectedIdx] ?? result?.images[0];
 
@@ -305,6 +314,14 @@ export function Console({ models, providers }: ConsoleProps) {
             </p>
           )}
         </div>
+
+        {/* Prompt templates / favorites */}
+        <TemplateBar
+          currentPrompt={prompt}
+          currentProviderId={model?.providerId}
+          currentModelId={modelId}
+          onApply={applyTemplate}
+        />
 
         {/* Prompt */}
         <div>
