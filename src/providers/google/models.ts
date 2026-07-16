@@ -36,7 +36,8 @@ const INPUT_PER_MTOK = 2; // text + image input, ~$2/1M
 
 export const GOOGLE_MODELS: ModelDescriptor[] = [
   {
-    id: "gemini-3-pro-image",
+    // Relay serves Pro under the -preview id (same pattern as flash).
+    id: "gemini-3-pro-image-preview",
     providerId: "google",
     label: "Gemini 3 Pro Image (Nano Banana Pro)",
     capabilities: {

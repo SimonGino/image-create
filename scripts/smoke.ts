@@ -96,13 +96,13 @@ async function scenarioOpenAINative(png: string): Promise<void> {
 }
 
 async function scenarioGeminiFanout(png: string): Promise<void> {
-  const model = GOOGLE_MODELS.find((m) => m.id === "gemini-3-pro-image");
+  const model = GOOGLE_MODELS.find((m) => m.id === "gemini-3-pro-image-preview");
   assert.ok(model, "gemini-3-pro-image metadata present");
   assert.equal(model.capabilities.supportsN, false, "Gemini has no native n");
 
   const req: GenerateRequest = {
     providerId: "google",
-    modelId: "gemini-3-pro-image",
+    modelId: "gemini-3-pro-image-preview",
     mode: "t2i",
     prompt: "three smoke-test swatches",
     sizeSpec: { kind: "ratio", aspectRatio: "16:9", imageSize: "2K" },
