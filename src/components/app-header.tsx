@@ -13,6 +13,7 @@ interface ProviderStatus {
 
 const TABS = [
   { href: "/", label: "生成" },
+  { href: "/compare", label: "对比" },
   { href: "/gallery", label: "图库" },
 ];
 
