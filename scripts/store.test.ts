@@ -292,10 +292,13 @@ describe("template-store", () => {
       body: "another",
       defaultProviderId: "google",
       defaultModelId: "gemini-3-pro-image-preview",
+      coverImagePath: "images/some-generation/0.png",
     });
 
     assert.equal(plain.favorite, false, "not favorited by default");
+    assert.equal(plain.coverImagePath, undefined, "absent cover is undefined, not null");
     assert.equal(starred.defaultProviderId, "google");
+    assert.equal(starred.coverImagePath, "images/some-generation/0.png", "cover round-trips");
     assert.equal(starred.variables, undefined, "absent column is undefined, not null");
     assert.ok(!Number.isNaN(new Date(starred.createdAt).getTime()), "createdAt is ISO");
 

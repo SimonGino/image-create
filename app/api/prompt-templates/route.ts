@@ -24,6 +24,7 @@ const createSchema = z.object({
   variables: z.array(z.string()).optional(),
   defaultProviderId: z.enum(PROVIDER_IDS).optional(),
   defaultModelId: z.string().optional(),
+  coverImagePath: z.string().optional(),
 });
 
 export async function POST(request: Request): Promise<Response> {

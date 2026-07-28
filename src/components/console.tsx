@@ -1,15 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ApiError,
   blobToBase64,
+  createTemplate,
   deleteGeneration,
+  deleteTemplate,
   downloadImage,
   generate as postGenerate,
+  listTemplates,
   mediaUrl,
   refImageFromUrl,
+  updateTemplate,
 } from "@/lib/api/client";
 import {
   partialFailureCode,
@@ -40,7 +44,6 @@ import type {
   Quality,
   RefImage,
 } from "@/providers/types";
-import { TemplateBar } from "@/components/template-bar";
 
 interface ConsoleProps {
   models: ModelDescriptor[];
@@ -106,9 +109,13 @@ export function Console({ models, providers }: ConsoleProps) {
   const patchClamped = (fields: Partial<GenerateRequest>) =>
     setDraft((d) => (model ? clampRequest(model, { ...d, ...fields }) : { ...d, ...fields }));
 
-  /** Switch model, keeping every setting the new one still accepts. */
-  function selectModel(next: ModelDescriptor) {
-    const clamped = clampRequest(next, draft);
+  /**
+   * Switch model, keeping every setting the new one still accepts. `base`
+   * lets a caller fold in other field changes atomically — passing the
+   * closure `draft` after a patch() would clobber that patch.
+   */
+  function selectModel(next: ModelDescriptor, base: GenerateRequest = draft) {
+    const clamped = clampRequest(next, base);
     setDraft(clamped);
     setUseCustom(
       clamped.sizeSpec.kind === "pixels" &&
@@ -118,6 +125,13 @@ export function Console({ models, providers }: ConsoleProps) {
         ),
     );
   }
+
+  // Mode is derived, not chosen: a reference image in the tray means
+  // reference mode, an empty tray means t2i (CONTEXT.md "Mode").
+  useEffect(() => {
+    const m: Mode = refInputs.length > 0 ? "reference" : "t2i";
+    setDraft((d) => (d.mode === m ? d : { ...d, mode: m }));
+  }, [refInputs.length]);
 
   // Keep the selection valid when mode or keys change.
   useEffect(() => {
@@ -162,26 +176,42 @@ export function Console({ models, providers }: ConsoleProps) {
   const [deleting, setDeleting] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Input chrome
+  const [paramsOpen, setParamsOpen] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Templates ("开始使用" cards + save-from-result)
+  const [templates, setTemplates] = useState<WirePromptTemplate[]>([]);
+  const refreshTemplates = useCallback(async () => {
+    try {
+      setTemplates(await listTemplates());
+    } catch {
+      // ignore — templates are non-critical
+    }
+  }, []);
+  useEffect(() => {
+    void refreshTemplates();
+  }, [refreshTemplates]);
+
   useEffect(() => () => void (timerRef.current && clearInterval(timerRef.current)), []);
 
   // Reset the selected preview whenever a new batch arrives.
   useEffect(() => setSelectedIdx(0), [result]);
 
-  // Pick up an image handed over from the gallery ("用作参考图").
+  // Pick up an image handed over from the gallery ("用作参考图") — adding it
+  // flips the derived mode to reference on its own.
   useEffect(() => {
     const pending = takePendingRef();
-    if (pending) {
-      patch({ mode: "reference" });
-      addRefUrl(pending);
-    }
+    if (pending) addRefUrl(pending);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canGenerate = Boolean(model && draft.prompt.trim() && !loading &&
-    (draft.mode !== "reference" || refInputs.length > 0));
+  const canGenerate = Boolean(model && draft.prompt.trim() && !loading);
 
   async function generate() {
-    if (!model) return;
+    if (!model || !canGenerate) return;
     setLoading(true);
     setError(null);
     setResult(null);
@@ -239,16 +269,19 @@ export function Console({ models, providers }: ConsoleProps) {
 
   // Fill the prompt (and default model, if usable in the current mode) from a template.
   function applyTemplate(t: WirePromptTemplate) {
-    patch({ prompt: t.body });
     const target = availableModels.find((m) => m.id === t.defaultModelId);
-    if (target) selectModel(target);
+    if (target) selectModel(target, { ...draft, prompt: t.body });
+    else patch({ prompt: t.body });
+    promptRef.current?.focus();
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function addRefFiles(files: File[]) {
-    if (files.length === 0) return;
+    const images = files.filter((f) => f.type.startsWith("image/"));
+    if (images.length === 0) return;
     setRefInputs((prev) => [
       ...prev,
-      ...files.map((file) => ({
+      ...images.map((file) => ({
         id: crypto.randomUUID(),
         kind: "file" as const,
         file,
@@ -273,380 +306,625 @@ export function Console({ models, providers }: ConsoleProps) {
     });
   }
 
-  // Feed a generated image back in as a reference, and switch to reference mode.
+  // Feed a generated image back in as a reference — mode follows on its own.
   function useAsReference(img: WireImage) {
     addRefUrl(mediaUrl(img.filePath));
-    patch({ mode: "reference" });
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   const caps = model?.capabilities;
   const currentImage = result?.images[selectedIdx] ?? result?.images[0];
   const partialFailure = partialFailureCode(result?.errorCode);
 
-  return (
-    <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[380px_1fr]">
-      {/* ---- Left: control panel ---- */}
-      <section className="space-y-4 rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900/40">
-        {/* Mode */}
-        <div>
-          <span className={labelClass()}>Mode</span>
-          <div className="inline-flex rounded-lg border border-neutral-200 p-0.5 dark:border-neutral-700">
-            {(["t2i", "reference"] as Mode[]).map((m) => (
-              <button
-                key={m}
-                onClick={() => patch({ mode: m })}
-                className={
-                  "rounded-md px-3 py-1 text-sm " +
-                  (draft.mode === m ? "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900" : "text-neutral-500")
-                }
-              >
-                {m === "t2i" ? "文生图" : "参考图"}
-              </button>
-            ))}
-          </div>
-        </div>
+  // Pill summary: what the next generation will produce, and for roughly how much.
+  const paramsSummary = [
+    pixels ? `${pixels.width}×${pixels.height}` : ratio ? `${ratio.aspectRatio} ${ratio.imageSize}` : null,
+    draft.n && draft.n > 1 ? `${draft.n}张` : null,
+    estimate !== undefined ? `≈${fmtUsd(estimate)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
-        {/* Model */}
-        <div>
-          <span className={labelClass()}>Model</span>
+  return (
+    <div className="mx-auto max-w-3xl px-6 pb-16 pt-10">
+      {/* ---- Hero ---- */}
+      <header className="mb-8 text-center">
+        <h1 className="font-serif text-4xl font-bold tracking-tight text-neutral-900 sm:text-5xl dark:text-neutral-50">
+          从文字，到图像
+        </h1>
+        <p className="mx-auto mt-3 max-w-md text-sm text-neutral-500 dark:text-neutral-400">
+          描述你想要的画面，其余交给模型；拖入一张图即可改图。
+        </p>
+      </header>
+
+      {/* ---- Input card ---- */}
+      <div
+        className={
+          "relative rounded-3xl border bg-white p-4 shadow-sm transition-shadow dark:bg-neutral-900 " +
+          (dragActive
+            ? "border-neutral-900 ring-2 ring-neutral-900/20 dark:border-white dark:ring-white/20"
+            : "border-neutral-200 dark:border-neutral-800")
+        }
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes("Files")) {
+            e.preventDefault();
+            setDragActive(true);
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragActive(false);
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragActive(false);
+          addRefFiles(Array.from(e.dataTransfer.files));
+        }}
+      >
+        {/* Reference tray — its mere presence is what makes this a reference run */}
+        {refInputs.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            {refInputs.map((r) => (
+              <div key={r.id} className="relative">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={r.kind === "file" ? r.previewUrl : r.url}
+                  alt="参考图"
+                  className="h-14 w-14 rounded-lg border border-neutral-200 object-cover dark:border-neutral-700"
+                />
+                <button
+                  type="button"
+                  onClick={() => removeRef(r.id)}
+                  aria-label="移除参考图"
+                  className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-neutral-900 text-[10px] leading-none text-white dark:bg-white dark:text-neutral-900"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            {caps && refInputs.length > (caps.maxRefImages ?? 1) && (
+              <span className="text-xs text-amber-600 dark:text-amber-400">
+                该模型最多 {caps.maxRefImages} 张参考图
+              </span>
+            )}
+          </div>
+        )}
+
+        <textarea
+          ref={promptRef}
+          className="min-h-[72px] w-full resize-none bg-transparent px-1 pt-1 text-base outline-none placeholder:text-neutral-400"
+          placeholder="描述你想要的图像…（可直接拖入参考图）"
+          value={draft.prompt}
+          onChange={(e) => patch({ prompt: e.target.value })}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") void generate();
+          }}
+        />
+
+        {/* Control row */}
+        <div className="mt-2 flex items-center gap-2">
+          {/* + reference images */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            onChange={(e) => {
+              addRefFiles(Array.from(e.target.files ?? []));
+              e.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            title="添加参考图"
+            aria-label="添加参考图"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-neutral-200 text-xl leading-none text-neutral-500 hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
+          >
+            +
+          </button>
+
+          {/* Model pill */}
           <select
-            className={controlClass()}
+            aria-label="模型"
+            className="h-9 max-w-[180px] appearance-none truncate rounded-full border border-neutral-200 bg-transparent px-3.5 text-sm text-neutral-700 outline-none hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
             value={draft.modelId}
             onChange={(e) => {
               const next = models.find((m) => m.id === e.target.value);
               if (next) selectModel(next);
             }}
           >
-            {availableModels.length === 0 && <option value="">该模式无可用模型</option>}
+            {availableModels.length === 0 && <option value="">无可用模型</option>}
             {availableModels.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.label}
               </option>
             ))}
           </select>
-          {caps && (
-            <p className="mt-1.5 text-xs text-neutral-400">
-              {caps.sizeSpecKind === "pixels" ? "像素尺寸" : "宽高比"} ·{" "}
-              {caps.supportsN ? `一次 ≤${caps.maxN} 张` : `单次 1 张(并发出 N)`} ·{" "}
-              参考图 ≤{caps.maxRefImages} · {caps.supportsMask ? "支持 mask" : "无 mask"}
-            </p>
+
+          {/* Params pill + popover */}
+          <div className="relative min-w-0">
+            <button
+              type="button"
+              onClick={() => setParamsOpen((v) => !v)}
+              className="flex h-9 items-center gap-1 truncate rounded-full border border-neutral-200 px-3.5 text-sm text-neutral-500 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800"
+            >
+              <span className="truncate">{paramsSummary || "参数"}</span>
+              <span className="text-neutral-400">▾</span>
+            </button>
+            {paramsOpen && caps && (
+              <>
+                <button
+                  type="button"
+                  aria-label="关闭参数面板"
+                  className="fixed inset-0 z-20 cursor-default"
+                  onClick={() => setParamsOpen(false)}
+                />
+                <div className="absolute left-0 top-full z-30 mt-2 w-[340px] max-w-[85vw] space-y-3 rounded-xl border border-neutral-200 bg-white p-4 shadow-lg dark:border-neutral-700 dark:bg-neutral-900">
+                  <p className="text-xs text-neutral-400">
+                    {caps.sizeSpecKind === "pixels" ? "像素尺寸" : "宽高比"} ·{" "}
+                    {caps.supportsN ? `一次 ≤${caps.maxN} 张` : "单次 1 张(并发出 N)"} ·{" "}
+                    参考图 ≤{caps.maxRefImages} · {caps.supportsMask ? "支持 mask" : "无 mask"}
+                  </p>
+
+                  {caps.sizeSpecKind === "pixels" ? (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="col-span-2">
+                        <span className={labelClass()}>尺寸</span>
+                        {caps.pixelBounds && (
+                          <label className="mb-1.5 flex items-center gap-1.5 text-xs text-neutral-500">
+                            <input type="checkbox" checked={useCustom} onChange={(e) => toggleCustom(e.target.checked)} />
+                            自定义尺寸（{caps.pixelBounds.min}–{caps.pixelBounds.max}px）
+                          </label>
+                        )}
+                        {useCustom && caps.pixelBounds ? (
+                          <div className="flex items-center gap-2">
+                            <input type="number" className={controlClass()} value={pixels?.width ?? 1024}
+                              min={caps.pixelBounds.min} max={caps.pixelBounds.max}
+                              onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: Number(e.target.value), height: pixels?.height ?? 1024 } })} />
+                            <span className="text-neutral-400">×</span>
+                            <input type="number" className={controlClass()} value={pixels?.height ?? 1024}
+                              min={caps.pixelBounds.min} max={caps.pixelBounds.max}
+                              onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: pixels?.width ?? 1024, height: Number(e.target.value) } })} />
+                          </div>
+                        ) : (
+                          <select
+                            className={controlClass()}
+                            value={pixels ? pixelSizeKey(pixels.width, pixels.height) : ""}
+                            onChange={(e) => {
+                              const preset = parsePixelSize(e.target.value);
+                              if (preset) patch({ sizeSpec: preset });
+                            }}
+                          >
+                            {caps.pixelSizes?.map((s) => (
+                              <option key={s} value={s}>{s}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                      {caps.qualities && (
+                        <div>
+                          <span className={labelClass()}>质量</span>
+                          <select className={controlClass()} value={draft.quality ?? ""} onChange={(e) => patch({ quality: e.target.value as Quality })}>
+                            {caps.qualities.map((q) => (
+                              <option key={q} value={q}>{q}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                      <div>
+                        <span className={labelClass()}>张数 n</span>
+                        <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
+                          onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <span className={labelClass()}>宽高比</span>
+                        <select
+                          className={controlClass()}
+                          value={ratio?.aspectRatio ?? ""}
+                          onChange={(e) =>
+                            ratio && patch({ sizeSpec: { ...ratio, aspectRatio: e.target.value as AspectRatio } })
+                          }
+                        >
+                          {caps.aspectRatios?.map((a) => (
+                            <option key={a} value={a}>{a}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <span className={labelClass()}>分辨率</span>
+                        <select
+                          className={controlClass()}
+                          value={ratio?.imageSize ?? ""}
+                          onChange={(e) =>
+                            ratio && patch({ sizeSpec: { ...ratio, imageSize: e.target.value as ImageSizeTier } })
+                          }
+                        >
+                          {caps.imageSizeTiers?.map((t) => (
+                            <option key={t} value={t}>{t}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <span className={labelClass()}>张数 n</span>
+                        <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
+                          onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
+                      </div>
+                    </div>
+                  )}
+
+                  {caps.outputFormats.length > 1 && (
+                    <div>
+                      <span className={labelClass()}>输出格式</span>
+                      <select className={controlClass()} value={draft.outputFormat ?? ""} onChange={(e) => patch({ outputFormat: e.target.value as OutputFormat })}>
+                        {caps.outputFormats.map((f) => (
+                          <option key={f} value={f}>{f}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {caps.extraParams?.length ? (
+                    <div className="space-y-3 border-t border-neutral-100 pt-3 dark:border-neutral-800">
+                      {caps.extraParams.map((p) => (
+                        <ExtraParamField
+                          key={p.key}
+                          schema={p}
+                          value={params[p.key]}
+                          onChange={(v) => setParam(p.key, v)}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <div className="flex items-baseline justify-between border-t border-neutral-100 pt-3 text-sm dark:border-neutral-800">
+                    <span className="text-neutral-500">预估成本</span>
+                    <span className="font-medium">
+                      ≈ {fmtUsd(estimate)}
+                      {estimate === undefined && <span className="ml-1 text-xs text-neutral-400">(生成后按实际计)</span>}
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Submit */}
+          <button
+            type="button"
+            onClick={() => void generate()}
+            disabled={!canGenerate}
+            title="生成 (⌘↵)"
+            aria-label="生成"
+            className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white transition-opacity disabled:opacity-30 dark:bg-white dark:text-neutral-900"
+          >
+            {loading ? (
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white dark:border-neutral-900/40 dark:border-t-neutral-900" />
+            ) : (
+              "↑"
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* ---- Loading / error / result, between the input and the cards ---- */}
+      {loading && (
+        <div className="mt-6 flex min-h-[200px] flex-col items-center justify-center gap-3 rounded-xl border border-neutral-200 text-sm text-neutral-500 dark:border-neutral-800">
+          <span className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-600 dark:border-neutral-700 dark:border-t-neutral-300" />
+          生成中… {elapsed}s
+        </div>
+      )}
+      {error && (
+        <div className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm dark:border-red-900/50 dark:bg-red-950/30">
+          <p className="font-medium text-red-700 dark:text-red-400">生成失败 · {error.code}</p>
+          <p className="mt-1 text-red-600 dark:text-red-300">{error.message}</p>
+          {error.issues && (
+            <ul className="mt-2 list-disc pl-5 text-red-600 dark:text-red-300">
+              {error.issues.map((i, idx) => (
+                <li key={idx}>{i.path ? `${i.path}: ` : ""}{i.message}</li>
+              ))}
+            </ul>
           )}
         </div>
+      )}
+      {result && currentImage && (
+        <div className="mt-6 space-y-3">
+          {/* Large preview of the selected image */}
+          <div className="flex items-center justify-center rounded-xl border border-neutral-200 bg-neutral-50 p-2 dark:border-neutral-800 dark:bg-neutral-900/40">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              key={currentImage.idx}
+              src={mediaUrl(currentImage.filePath)}
+              alt={`result ${currentImage.idx}`}
+              className="max-h-[68vh] w-auto max-w-full rounded-lg object-contain"
+            />
+          </div>
 
-        {/* Prompt templates / favorites */}
-        <TemplateBar
-          currentPrompt={draft.prompt}
-          currentProviderId={model?.providerId}
-          currentModelId={draft.modelId}
-          onApply={applyTemplate}
-        />
+          {/* Batch thumbnail strip */}
+          {result.images.length > 1 && (
+            <div className="flex flex-wrap gap-2">
+              {result.images.map((img, i) => (
+                <button
+                  key={img.idx}
+                  onClick={() => setSelectedIdx(i)}
+                  aria-label={`选择第 ${i + 1} 张`}
+                  className={
+                    "overflow-hidden rounded-lg border-2 transition-colors " +
+                    (i === selectedIdx
+                      ? "border-neutral-900 dark:border-white"
+                      : "border-transparent hover:border-neutral-300 dark:hover:border-neutral-600")
+                  }
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={mediaUrl(img.filePath)}
+                    alt={`缩略图 ${i + 1}`}
+                    className="h-16 w-16 object-cover"
+                  />
+                </button>
+              ))}
+            </div>
+          )}
 
-        {/* Prompt */}
-        <div>
-          <span className={labelClass()}>提示词</span>
-          <textarea
-            className={controlClass() + " min-h-[90px] resize-y"}
-            placeholder="描述你想要的图像…"
-            value={draft.prompt}
-            onChange={(e) => patch({ prompt: e.target.value })}
+          {/* Partial fan-out failure — billed siblings were kept (SPEC §3). */}
+          {partialFailure && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+              请求了 {result.nRequested} 张,成功 {result.images.length} 张（{partialFailure}）。
+              已出的图与费用已记录。
+            </div>
+          )}
+
+          {/* Result meta */}
+          <div className="rounded-lg border border-neutral-200 p-3 text-xs text-neutral-500 dark:border-neutral-800">
+            <span className="font-medium text-neutral-700 dark:text-neutral-300">{result.modelId}</span>
+            {" · "}
+            {currentImage.width && currentImage.height ? `${currentImage.width}×${currentImage.height}` : "—"}
+            {result.images.length > 1 && ` · 第 ${selectedIdx + 1}/${result.images.length} 张`}
+            {" · "}
+            {fmtDuration(result.timingMs)}
+            {" · "}
+            实际 {fmtUsd(result.costUsd)}
+            {result.costSource ? ` (${result.costSource})` : ""}
+            {" · "}
+            out {result.usage.imageOutputTokens ?? "—"} tok
+          </div>
+
+          {/* Actions */}
+          <ResultActions
+            result={result}
+            currentImage={currentImage}
+            canGenerate={canGenerate}
+            deleting={deleting}
+            onDownload={() => void downloadCurrent(currentImage)}
+            onUseAsRef={() => useAsReference(currentImage)}
+            onRegenerate={() => void generate()}
+            onDelete={() => void deleteCurrent()}
+            onTemplateSaved={refreshTemplates}
           />
         </div>
+      )}
 
-        {/* Reference images */}
-        {draft.mode === "reference" && (
-          <div>
-            <span className={labelClass()}>参考图（≤{caps?.maxRefImages ?? 1}）</span>
-            {refInputs.length > 0 && (
-              <div className="mb-2 flex flex-wrap gap-2">
-                {refInputs.map((r) => (
-                  <div key={r.id} className="relative">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={r.kind === "file" ? r.previewUrl : r.url}
-                      alt="参考图"
-                      className="h-14 w-14 rounded-md border border-neutral-200 object-cover dark:border-neutral-700"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => removeRef(r.id)}
-                      aria-label="移除参考图"
-                      className="absolute -right-1.5 -top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-neutral-900 text-[10px] leading-none text-white dark:bg-white dark:text-neutral-900"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              onChange={(e) => {
-                addRefFiles(Array.from(e.target.files ?? []));
-                e.target.value = "";
-              }}
-              className="block w-full text-xs text-neutral-500 file:mr-3 file:rounded-md file:border-0 file:bg-neutral-100 file:px-3 file:py-1.5 file:text-sm dark:file:bg-neutral-800"
-            />
-            <p className="mt-1 text-xs text-neutral-400">上传,或用下方生成结果的「用作参考图」</p>
-          </div>
-        )}
-
-        {/* Dynamic parameter panel (capabilities-driven) */}
-        {caps?.sizeSpecKind === "pixels" ? (
-          <div className="grid grid-cols-2 gap-3">
-            <div className="col-span-2">
-              <span className={labelClass()}>尺寸</span>
-              {caps.pixelBounds && (
-                <label className="mb-1.5 flex items-center gap-1.5 text-xs text-neutral-500">
-                  <input type="checkbox" checked={useCustom} onChange={(e) => toggleCustom(e.target.checked)} />
-                  自定义尺寸（{caps.pixelBounds.min}–{caps.pixelBounds.max}px）
-                </label>
-              )}
-              {useCustom && caps.pixelBounds ? (
-                <div className="flex items-center gap-2">
-                  <input type="number" className={controlClass()} value={pixels?.width ?? 1024}
-                    min={caps.pixelBounds.min} max={caps.pixelBounds.max}
-                    onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: Number(e.target.value), height: pixels?.height ?? 1024 } })} />
-                  <span className="text-neutral-400">×</span>
-                  <input type="number" className={controlClass()} value={pixels?.height ?? 1024}
-                    min={caps.pixelBounds.min} max={caps.pixelBounds.max}
-                    onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: pixels?.width ?? 1024, height: Number(e.target.value) } })} />
-                </div>
-              ) : (
-                <select
-                  className={controlClass()}
-                  value={pixels ? pixelSizeKey(pixels.width, pixels.height) : ""}
-                  onChange={(e) => {
-                    const preset = parsePixelSize(e.target.value);
-                    if (preset) patch({ sizeSpec: preset });
-                  }}
-                >
-                  {caps.pixelSizes?.map((s) => (
-                    <option key={s} value={s}>{s}</option>
-                  ))}
-                </select>
-              )}
-            </div>
-            {caps.qualities && (
-              <div>
-                <span className={labelClass()}>质量</span>
-                <select className={controlClass()} value={draft.quality ?? ""} onChange={(e) => patch({ quality: e.target.value as Quality })}>
-                  {caps.qualities.map((q) => (
-                    <option key={q} value={q}>{q}</option>
-                  ))}
-                </select>
-              </div>
-            )}
-            <div>
-              <span className={labelClass()}>张数 n</span>
-              <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
-                onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
-            </div>
-          </div>
-        ) : caps?.sizeSpecKind === "ratio" ? (
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <span className={labelClass()}>宽高比</span>
-              <select
-                className={controlClass()}
-                value={ratio?.aspectRatio ?? ""}
-                onChange={(e) =>
-                  ratio && patch({ sizeSpec: { ...ratio, aspectRatio: e.target.value as AspectRatio } })
-                }
-              >
-                {caps.aspectRatios?.map((a) => (
-                  <option key={a} value={a}>{a}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <span className={labelClass()}>分辨率</span>
-              <select
-                className={controlClass()}
-                value={ratio?.imageSize ?? ""}
-                onChange={(e) =>
-                  ratio && patch({ sizeSpec: { ...ratio, imageSize: e.target.value as ImageSizeTier } })
-                }
-              >
-                {caps.imageSizeTiers?.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <span className={labelClass()}>张数 n</span>
-              <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
-                onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
-            </div>
-          </div>
-        ) : null}
-
-        {/* Output format */}
-        {caps && caps.outputFormats.length > 1 && (
-          <div>
-            <span className={labelClass()}>输出格式</span>
-            <select className={controlClass()} value={draft.outputFormat ?? ""} onChange={(e) => patch({ outputFormat: e.target.value as OutputFormat })}>
-              {caps.outputFormats.map((f) => (
-                <option key={f} value={f}>{f}</option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        {/* Provider-private params */}
-        {caps?.extraParams?.length ? (
-          <div className="space-y-3 border-t border-neutral-100 pt-3 dark:border-neutral-800">
-            {caps.extraParams.map((p) => (
-              <ExtraParamField
-                key={p.key}
-                schema={p}
-                value={params[p.key]}
-                onChange={(v) => setParam(p.key, v)}
+      {/* ---- Template cards ---- */}
+      <section className="mt-12">
+        <h2 className="mb-4 text-sm font-medium text-neutral-500">开始使用</h2>
+        {templates.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-neutral-200 p-6 text-center text-sm text-neutral-400 dark:border-neutral-800">
+            还没有模板——生成一张满意的图后,在结果里点「存为模板」,它就会出现在这里。
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {templates.map((t) => (
+              <TemplateCard
+                key={t.id}
+                template={t}
+                onApply={() => applyTemplate(t)}
+                onToggleFavorite={async () => {
+                  await updateTemplate(t.id, { favorite: !t.favorite });
+                  await refreshTemplates();
+                }}
+                onDelete={async () => {
+                  await deleteTemplate(t.id);
+                  await refreshTemplates();
+                }}
               />
             ))}
           </div>
-        ) : null}
+        )}
+      </section>
+    </div>
+  );
+}
 
-        {/* Cost estimate + generate */}
-        <div className="border-t border-neutral-100 pt-3 dark:border-neutral-800">
-          <div className="mb-2 flex items-baseline justify-between text-sm">
-            <span className="text-neutral-500">预估成本</span>
-            <span className="font-medium">
-              ≈ {fmtUsd(estimate)}
-              {estimate === undefined && <span className="ml-1 text-xs text-neutral-400">(生成后按实际计)</span>}
-            </span>
-          </div>
+/** Result action row, including save-as-template (title prompt + cover capture). */
+function ResultActions({
+  result,
+  currentImage,
+  canGenerate,
+  deleting,
+  onDownload,
+  onUseAsRef,
+  onRegenerate,
+  onDelete,
+  onTemplateSaved,
+}: {
+  result: WireGenerationDetail;
+  currentImage: WireImage;
+  canGenerate: boolean;
+  deleting: boolean;
+  onDownload: () => void;
+  onUseAsRef: () => void;
+  onRegenerate: () => void;
+  onDelete: () => void;
+  onTemplateSaved: () => Promise<void>;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [title, setTitle] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const secondary =
+    "rounded-lg border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800";
+
+  async function save() {
+    if (!title.trim() || busy) return;
+    setBusy(true);
+    try {
+      // The template remembers the prompt that actually produced this image,
+      // with the selected image as its card cover.
+      await createTemplate({
+        title: title.trim(),
+        body: result.prompt,
+        defaultProviderId: result.providerId,
+        defaultModelId: result.modelId,
+        coverImagePath: currentImage.filePath,
+      });
+      setTitle("");
+      setSaving(false);
+      setSaved(true);
+      await onTemplateSaved();
+    } catch {
+      // ignore — templates are non-critical
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-2">
+        <button onClick={onDownload} className={secondary}>
+          下载
+        </button>
+        <button onClick={onUseAsRef} className={secondary}>
+          用作参考图
+        </button>
+        <button
+          onClick={() => {
+            setSaving((v) => !v);
+            setSaved(false);
+          }}
+          className={secondary}
+        >
+          {saved ? "已存为模板 ✓" : "存为模板"}
+        </button>
+        <button
+          onClick={onRegenerate}
+          disabled={!canGenerate}
+          className="rounded-lg bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-white dark:text-neutral-900"
+        >
+          重生
+        </button>
+        <button
+          onClick={onDelete}
+          disabled={deleting}
+          className="rounded-lg border border-red-200 px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-40 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
+        >
+          {deleting ? "删除中…" : "删除"}
+        </button>
+      </div>
+      {saving && (
+        <div className="flex items-center gap-2">
+          <input
+            className={controlClass()}
+            placeholder="模板标题"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void save();
+            }}
+            autoFocus
+          />
           <button
-            onClick={generate}
-            disabled={!canGenerate}
-            className="w-full rounded-lg bg-neutral-900 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-white dark:text-neutral-900"
+            type="button"
+            onClick={() => void save()}
+            disabled={!title.trim() || busy}
+            className="whitespace-nowrap rounded-lg bg-neutral-900 px-3 py-1.5 text-sm text-white disabled:opacity-40 dark:bg-white dark:text-neutral-900"
           >
-            {loading ? `生成中… ${elapsed}s` : "生成"}
+            保存
           </button>
         </div>
-      </section>
+      )}
+    </div>
+  );
+}
 
-      {/* ---- Right: result preview ---- */}
-      <section className="min-h-[300px]">
-        {!result && !error && !loading && (
-          <div className="flex h-full min-h-[300px] items-center justify-center rounded-xl border border-dashed border-neutral-200 text-sm text-neutral-400 dark:border-neutral-800">
-            结果会显示在这里
-          </div>
-        )}
-        {loading && (
-          <div className="flex h-full min-h-[300px] flex-col items-center justify-center gap-3 rounded-xl border border-neutral-200 text-sm text-neutral-500 dark:border-neutral-800">
-            <span className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-600 dark:border-neutral-700 dark:border-t-neutral-300" />
-            生成中… {elapsed}s
-          </div>
-        )}
-        {error && (
-          <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm dark:border-red-900/50 dark:bg-red-950/30">
-            <p className="font-medium text-red-700 dark:text-red-400">生成失败 · {error.code}</p>
-            <p className="mt-1 text-red-600 dark:text-red-300">{error.message}</p>
-            {error.issues && (
-              <ul className="mt-2 list-disc pl-5 text-red-600 dark:text-red-300">
-                {error.issues.map((i, idx) => (
-                  <li key={idx}>{i.path ? `${i.path}: ` : ""}{i.message}</li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {result && currentImage && (
-          <div className="space-y-3">
-            {/* Large preview of the selected image */}
-            <div className="flex items-center justify-center rounded-xl border border-neutral-200 bg-neutral-50 p-2 dark:border-neutral-800 dark:bg-neutral-900/40">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                key={currentImage.idx}
-                src={mediaUrl(currentImage.filePath)}
-                alt={`result ${currentImage.idx}`}
-                className="max-h-[68vh] w-auto max-w-full rounded-lg object-contain"
-              />
-            </div>
+/** One "开始使用" card. A dangling cover (deleted generation) hides itself. */
+function TemplateCard({
+  template,
+  onApply,
+  onToggleFavorite,
+  onDelete,
+}: {
+  template: WirePromptTemplate;
+  onApply: () => void;
+  onToggleFavorite: () => Promise<void>;
+  onDelete: () => Promise<void>;
+}) {
+  const [coverBroken, setCoverBroken] = useState(false);
+  const cover = template.coverImagePath && !coverBroken ? mediaUrl(template.coverImagePath) : undefined;
 
-            {/* Batch thumbnail strip */}
-            {result.images.length > 1 && (
-              <div className="flex flex-wrap gap-2">
-                {result.images.map((img, i) => (
-                  <button
-                    key={img.idx}
-                    onClick={() => setSelectedIdx(i)}
-                    aria-label={`选择第 ${i + 1} 张`}
-                    className={
-                      "overflow-hidden rounded-lg border-2 transition-colors " +
-                      (i === selectedIdx
-                        ? "border-neutral-900 dark:border-white"
-                        : "border-transparent hover:border-neutral-300 dark:hover:border-neutral-600")
-                    }
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={mediaUrl(img.filePath)}
-                      alt={`缩略图 ${i + 1}`}
-                      className="h-16 w-16 object-cover"
-                    />
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* Partial fan-out failure — billed siblings were kept (SPEC §3). */}
-            {partialFailure && (
-              <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
-                请求了 {result.nRequested} 张,成功 {result.images.length} 张（{partialFailure}）。
-                已出的图与费用已记录。
-              </div>
-            )}
-
-            {/* Result meta */}
-            <div className="rounded-lg border border-neutral-200 p-3 text-xs text-neutral-500 dark:border-neutral-800">
-              <span className="font-medium text-neutral-700 dark:text-neutral-300">{result.modelId}</span>
-              {" · "}
-              {currentImage.width && currentImage.height ? `${currentImage.width}×${currentImage.height}` : "—"}
-              {result.images.length > 1 && ` · 第 ${selectedIdx + 1}/${result.images.length} 张`}
-              {" · "}
-              {fmtDuration(result.timingMs)}
-              {" · "}
-              实际 {fmtUsd(result.costUsd)}
-              {result.costSource ? ` (${result.costSource})` : ""}
-              {" · "}
-              out {result.usage.imageOutputTokens ?? "—"} tok
-            </div>
-
-            {/* Actions */}
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={() => void downloadCurrent(currentImage)}
-                className="rounded-lg border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-40 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
-              >
-                下载
-              </button>
-              <button
-                onClick={() => useAsReference(currentImage)}
-                className="rounded-lg border border-neutral-200 px-3 py-1.5 text-sm font-medium text-neutral-700 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-200 dark:hover:bg-neutral-800"
-              >
-                用作参考图
-              </button>
-              <button
-                onClick={generate}
-                disabled={!canGenerate}
-                className="rounded-lg bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-white dark:text-neutral-900"
-              >
-                重生
-              </button>
-              <button
-                onClick={() => void deleteCurrent()}
-                disabled={deleting}
-                className="rounded-lg border border-red-200 px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:opacity-40 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
-              >
-                {deleting ? "删除中…" : "删除"}
-              </button>
-            </div>
-          </div>
-        )}
-      </section>
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onApply}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onApply();
+        }
+      }}
+      className="group flex cursor-pointer items-stretch justify-between gap-3 rounded-xl border border-neutral-200 bg-white p-4 text-left transition-colors hover:border-neutral-300 dark:border-neutral-800 dark:bg-neutral-900 dark:hover:border-neutral-600"
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <h3 className="truncate text-sm font-medium text-neutral-900 dark:text-neutral-100">
+            {template.title}
+          </h3>
+          <span className="text-neutral-300 transition-transform group-hover:translate-x-0.5">›</span>
+        </div>
+        <p className="mt-1 line-clamp-2 text-sm text-neutral-500" title={template.body}>
+          {template.body}
+        </p>
+        <div className="mt-2 flex gap-2 text-xs">
+          <button
+            type="button"
+            title="收藏"
+            onClick={(e) => {
+              e.stopPropagation();
+              void onToggleFavorite();
+            }}
+            className={template.favorite ? "text-yellow-500" : "text-neutral-300 hover:text-neutral-400"}
+          >
+            {template.favorite ? "★" : "☆"}
+          </button>
+          <button
+            type="button"
+            title="删除模板"
+            onClick={(e) => {
+              e.stopPropagation();
+              void onDelete();
+            }}
+            className="text-neutral-300 hover:text-red-500"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      {cover && (
+        <div className="flex shrink-0 items-center">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={cover}
+            alt=""
+            onError={() => setCoverBroken(true)}
+            className="h-20 w-24 rounded-lg border border-neutral-100 object-cover dark:border-neutral-800"
+          />
+        </div>
+      )}
     </div>
   );
 }
