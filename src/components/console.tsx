@@ -269,7 +269,11 @@ export function Console({ models, providers }: ConsoleProps) {
 
   // Fill the prompt (and default model, if usable in the current mode) from a template.
   function applyTemplate(t: WirePromptTemplate) {
-    const target = availableModels.find((m) => m.id === t.defaultModelId);
+    // Looked up among every keyed model rather than `availableModels`: that
+    // list is filtered by the *derived* mode, so a mode-filtered lookup would
+    // silently drop the template's model choice. A model with no key still
+    // can't be selected — the pill shows what will actually be used.
+    const target = models.find((m) => m.id === t.defaultModelId && hasKey(m.providerId));
     if (target) selectModel(target, { ...draft, prompt: t.body });
     else patch({ prompt: t.body });
     promptRef.current?.focus();

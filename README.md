@@ -71,8 +71,8 @@ app/
   api/usage/route.ts              GET  — cumulative cost by provider / model / month
   api/prompt-templates/…          GET/POST · [id] PATCH/DELETE
 src/
-  components/                     client UI: console, gallery, app-header,
-                                  usage-chip, template-bar
+  components/                     client UI: console, gallery, history, compare,
+                                  app-header, usage-chip, settings-form
   providers/                      the abstraction (SPEC §3)
     types.ts errors.ts registry.ts pricing.ts
     openai/  google/              the two adapters (models metadata + adapter)
