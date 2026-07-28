@@ -3,10 +3,15 @@
  * the real orchestration + persistence path (validate → insert → generate →
  * write image + thumbnail → record usage & cost), then reads back from SQLite.
  *
- * Two scenarios:
+ * Five scenarios:
  *   1. OpenAI-style native batch (supportsN, n=1) → one image.
  *   2. Gemini-style fan-out (supportsN=false, n=3) → 3 concurrent single-image
  *      calls merged into one Generation with summed usage/cost.
+ *   3. Partial fan-out failure → billed siblings persisted, status stays
+ *      success, error_code records "partial_failure:<code>".
+ *   4. All shots fail → Generation is error with the shot's code and timing.
+ *   5. Provider returns no usage → the pre-flight estimate is what gets
+ *      recorded, marked cost_source='estimated'.
  *
  * Run: npm run smoke   (after `npm run db:generate`)
  */
@@ -20,6 +25,7 @@ import sharp from "sharp";
 import { db } from "@/db";
 import { generationImages, generations } from "@/db/schema";
 import { absFromRoot } from "@/lib/paths";
+import { ProviderError, RateLimitError } from "@/providers/errors";
 import { GOOGLE_MODELS } from "@/providers/google/models";
 import { OPENAI_MODELS } from "@/providers/openai/models";
 import type {
@@ -48,7 +54,6 @@ function fakeAdapter(
   return {
     providerId: model.providerId,
     listModels: () => [model],
-    validate: () => ({ ok: true }),
     async generate(): Promise<GenerateResult> {
       return {
         images: [{ data: png, mimeType: "image/png", width: 512, height: 512 }],
@@ -137,11 +142,133 @@ async function scenarioGeminiFanout(png: string): Promise<void> {
   console.log(`  2) gemini fan-out  → 3 img  cost=$${summary.costUsd}  gen=${summary.generationId}`);
 }
 
+async function scenarioPartialFanout(png: string): Promise<void> {
+  const model = GOOGLE_MODELS.find((m) => m.id === "gemini-3-pro-image-preview");
+  assert.ok(model, "gemini-3-pro-image metadata present");
+
+  let calls = 0;
+  const adapter: ImageProviderAdapter = {
+    providerId: model.providerId,
+    listModels: () => [model],
+    async generate(): Promise<GenerateResult> {
+      if (calls++ === 1) throw new ProviderError("shot 2 exploded");
+      return {
+        images: [{ data: png, mimeType: "image/png", width: 512, height: 512 }],
+        usage: { imageOutputTokens: 100 },
+        timingMs: 7,
+      };
+    },
+  };
+
+  const req: GenerateRequest = {
+    providerId: "google",
+    modelId: "gemini-3-pro-image-preview",
+    mode: "t2i",
+    prompt: "partial fan-out",
+    sizeSpec: { kind: "ratio", aspectRatio: "1:1", imageSize: "1K" },
+    n: 3,
+  };
+
+  const summary = await runGeneration(req, { adapter });
+
+  // Billed siblings survive; the failure is recorded, not thrown.
+  assert.equal(summary.status, "success");
+  assert.equal(summary.images.length, 2, "2 of 3 shots kept");
+  assert.equal(summary.imagesFailed, 1, "failed shot count reported");
+  assert.equal(summary.errorCode, "partial_failure:provider");
+  assert.equal(summary.usage.imageOutputTokens, 200, "usage summed over surviving shots");
+
+  for (const img of summary.images) {
+    assert.ok(fs.existsSync(absFromRoot(img.filePath)), `surviving image ${img.idx} written`);
+  }
+
+  const row = db.select().from(generations).where(eq(generations.id, summary.generationId)).get();
+  assert.ok(row, "generation row persisted");
+  assert.equal(row.status, "success", "partial failure still counts as success");
+  assert.equal(row.errorCode, "partial_failure:provider", "shot failure recorded");
+
+  const imgRows = db
+    .select()
+    .from(generationImages)
+    .where(eq(generationImages.generationId, summary.generationId))
+    .all();
+  assert.equal(imgRows.length, 2, "billed siblings persisted");
+
+  console.log(`  3) partial fan-out → 2/3 img kept, error_code=${row.errorCode}`);
+}
+
+async function scenarioAllShotsFail(): Promise<void> {
+  const model = GOOGLE_MODELS.find((m) => m.id === "gemini-3-pro-image-preview");
+  assert.ok(model, "gemini-3-pro-image metadata present");
+
+  const adapter: ImageProviderAdapter = {
+    providerId: model.providerId,
+    listModels: () => [model],
+    async generate(): Promise<GenerateResult> {
+      throw new RateLimitError("quota exhausted");
+    },
+  };
+
+  const prompt = `all shots fail ${Date.now()}`;
+  const req: GenerateRequest = {
+    providerId: "google",
+    modelId: "gemini-3-pro-image-preview",
+    mode: "t2i",
+    prompt,
+    sizeSpec: { kind: "ratio", aspectRatio: "1:1", imageSize: "1K" },
+    n: 2,
+  };
+
+  await assert.rejects(runGeneration(req, { adapter }), RateLimitError);
+
+  const row = db.select().from(generations).where(eq(generations.prompt, prompt)).get();
+  assert.ok(row, "generation row persisted");
+  assert.equal(row.status, "error");
+  assert.equal(row.errorCode, "rate_limit", "first shot's code recorded");
+  assert.ok(row.timingMs !== null, "error branch records timing");
+
+  console.log(`  4) all shots fail  → status=error code=${row.errorCode} timing=${row.timingMs}ms`);
+}
+
+async function scenarioNoUsageReturned(png: string): Promise<void> {
+  const model = GOOGLE_MODELS.find((m) => m.id === "gemini-3-pro-image-preview");
+  assert.ok(model, "gemini-3-pro-image metadata present");
+
+  const prompt = `no usage metadata ${Date.now()}`;
+  const req: GenerateRequest = {
+    providerId: "google",
+    modelId: "gemini-3-pro-image-preview",
+    mode: "t2i",
+    prompt,
+    sizeSpec: { kind: "ratio", aspectRatio: "1:1", imageSize: "2K" },
+    n: 1,
+  };
+
+  // Relays and proxies sometimes drop usageMetadata: the pre-flight estimate has
+  // to survive as the recorded cost, marked 'estimated' (SPEC §6).
+  const summary = await runGeneration(req, { adapter: fakeAdapter(model, png, {}) });
+
+  assert.equal(summary.status, "success");
+  assert.equal(summary.costUsd, 0.134, "2K tier estimate kept");
+  assert.equal(summary.costSource, "estimated", "and reported as an estimate, not as actual");
+
+  const row = db.select().from(generations).where(eq(generations.prompt, prompt)).get();
+  assert.ok(row, "generation row persisted");
+  assert.equal(row.costUsd, 0.134, "the estimate is what the row still carries");
+  assert.equal(row.costSource, "estimated");
+  assert.equal(row.imageOutputTokens, null, "no usage to store");
+
+  console.log(`  5) no usage        → cost=$${row.costUsd} source=${row.costSource}`);
+}
+
 async function main(): Promise<void> {
   const png = await makePngBase64();
   await scenarioOpenAINative(png);
   await scenarioGeminiFanout(png);
-  console.log("\n✓ end-to-end smoke passed (native batch + fan-out)");
+  await scenarioPartialFanout(png);
+  await scenarioAllShotsFail();
+  await scenarioNoUsageReturned(png);
+  console.log("\n✓ end-to-end smoke passed (native batch + fan-out + partial failure + cost fallback)");
 }
 
 main()

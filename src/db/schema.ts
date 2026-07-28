@@ -11,10 +11,12 @@
 
 import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
+// Type-only (erased), so drizzle-kit still loads this file without pulling
+// pricing at runtime. `cost_source` is pricing's concept, not the schema's.
+import type { CostSource } from "../providers/pricing";
 import type { Mode, OutputFormat, ProviderId, Quality, SizeSpec } from "../providers/types";
 
 export type GenerationStatus = "pending" | "success" | "error";
-export type CostSource = "estimated" | "actual";
 export type RefImageRole = "image" | "mask";
 
 const uuid = () => crypto.randomUUID();

@@ -1,20 +1,20 @@
-import { desc, eq } from "drizzle-orm";
+/**
+ * GET  /api/prompt-templates — list (favorites first, then newest).
+ * POST /api/prompt-templates — create.
+ *
+ * Queries belong to @/lib/template-store.
+ */
+
 import { z } from "zod";
 
-import { db } from "@/db";
-import { promptTemplates } from "@/db/schema";
+import { createTemplate, listTemplates } from "@/lib/template-store";
+import { PROVIDER_IDS } from "@/providers/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** List templates — favorites first, then newest. */
 export function GET(): Response {
-  const templates = db
-    .select()
-    .from(promptTemplates)
-    .orderBy(desc(promptTemplates.favorite), desc(promptTemplates.createdAt))
-    .all();
-  return Response.json({ templates });
+  return Response.json({ templates: listTemplates() });
 }
 
 const createSchema = z.object({
@@ -22,7 +22,7 @@ const createSchema = z.object({
   body: z.string().min(1),
   favorite: z.boolean().optional(),
   variables: z.array(z.string()).optional(),
-  defaultProviderId: z.enum(["openai", "google"]).optional(),
+  defaultProviderId: z.enum(PROVIDER_IDS).optional(),
   defaultModelId: z.string().optional(),
 });
 
@@ -41,10 +41,5 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const id = crypto.randomUUID();
-  db.insert(promptTemplates)
-    .values({ id, ...parsed.data })
-    .run();
-  const row = db.select().from(promptTemplates).where(eq(promptTemplates.id, id)).get();
-  return Response.json(row, { status: 201 });
+  return Response.json(createTemplate(parsed.data), { status: 201 });
 }

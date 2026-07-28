@@ -2,19 +2,9 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-/** Mirrors GET /api/usage (SPEC §6). Kept local — the route is the contract. */
-interface UsageBucket {
-  costUsd: number;
-  count: number;
-}
-interface UsageSummary {
-  total: UsageBucket;
-  byProvider: (UsageBucket & { providerId: string })[];
-  byModel: (UsageBucket & { modelId: string })[];
-  byMonth: (UsageBucket & { month: string })[];
-}
-
-const fmtUsd = (v: number): string => `$${v.toFixed(3)}`;
+import { getUsage } from "@/lib/api/client";
+import type { WireUsageSummary } from "@/lib/api/wire";
+import { fmtUsd } from "@/lib/format";
 
 /**
  * Cumulative-usage chip for the top bar (SPEC §7). Shows `累计 $x.xxx`; on hover
@@ -22,7 +12,7 @@ const fmtUsd = (v: number): string => `$${v.toFixed(3)}`;
  * Client-only — fetches /api/usage on mount; never touches the DB directly.
  */
 export function UsageChip() {
-  const [data, setData] = useState<UsageSummary | null>(null);
+  const [data, setData] = useState<WireUsageSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [hovered, setHovered] = useState(false);
   const [pinned, setPinned] = useState(false);
@@ -30,8 +20,7 @@ export function UsageChip() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/usage")
-      .then((r) => (r.ok ? (r.json() as Promise<UsageSummary>) : Promise.reject(new Error(String(r.status)))))
+    getUsage()
       .then((json) => {
         if (!cancelled) setData(json);
       })

@@ -2,7 +2,33 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  ApiError,
+  blobToBase64,
+  deleteGeneration,
+  downloadImage,
+  generate as postGenerate,
+  mediaUrl,
+  refImageFromUrl,
+} from "@/lib/api/client";
+import {
+  partialFailureCode,
+  type ProviderKeyStatus,
+  type WireGenerationDetail,
+  type WireImage,
+  type WirePromptTemplate,
+} from "@/lib/api/wire";
+import { fmtDuration, fmtUsd } from "@/lib/format";
+import { takePendingRef } from "@/lib/pending-ref";
 import { estimateCostUSD } from "@/providers/pricing";
+import {
+  clampRequest,
+  defaultRequestFor,
+  effectiveMaxN,
+  parsePixelSize,
+  pixelSizeKey,
+  type ParamValue,
+} from "@/providers/request";
 import type {
   AspectRatio,
   GenerateRequest,
@@ -11,50 +37,14 @@ import type {
   Mode,
   OutputFormat,
   ParamSchema,
-  ProviderId,
   Quality,
-  SizeSpec,
+  RefImage,
 } from "@/providers/types";
-import { TemplateBar, type PromptTemplate } from "@/components/template-bar";
-
-// Client-side ceiling for Gemini-style fan-out (mirrors MAX_FANOUT_N in the adapter).
-const MAX_FANOUT_N = 8;
-
-interface ProviderStatus {
-  providerId: ProviderId;
-  hasKey: boolean;
-}
+import { TemplateBar } from "@/components/template-bar";
 
 interface ConsoleProps {
   models: ModelDescriptor[];
-  providers: ProviderStatus[];
-}
-
-interface GenImage {
-  idx: number;
-  filePath: string;
-  width?: number;
-  height?: number;
-  mimeType: string;
-}
-
-interface GenResult {
-  generationId: string;
-  status: string;
-  providerId: string;
-  modelId: string;
-  mode: string;
-  images: GenImage[];
-  usage: { textInputTokens?: number; imageInputTokens?: number; imageOutputTokens?: number };
-  costUsd?: number;
-  costSource?: string;
-  timingMs?: number;
-}
-
-interface ApiError {
-  code: string;
-  message: string;
-  issues?: { path?: string; code: string; message: string }[];
+  providers: ProviderKeyStatus[];
 }
 
 /** A reference-image input: an uploaded file, or a URL to an already-generated image. */
@@ -62,27 +52,18 @@ type RefInput =
   | { id: string; kind: "file"; file: File; previewUrl: string }
   | { id: string; kind: "url"; url: string };
 
-/** stored path is "data/images/{id}/{file}"; the media route serves under images/. */
-function mediaUrl(filePath: string): string {
-  return "/api/images/" + filePath.replace(/^data\/images\//, "");
-}
-
-function fmtUsd(v: number | undefined): string {
-  return v === undefined ? "—" : `$${v.toFixed(3)}`;
-}
-
-async function blobToBase64(blob: Blob): Promise<string> {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-/** sessionStorage key for handing a gallery image to the console as a reference. */
-const PENDING_REF_KEY = "imageCreate:pendingRef";
+/**
+ * Stand-in for the impossible case of no registered model — the page hands us
+ * the whole registry, and with no model every control is hidden anyway.
+ */
+const BLANK_DRAFT: GenerateRequest = {
+  providerId: "openai",
+  modelId: "",
+  mode: "t2i",
+  prompt: "",
+  sizeSpec: { kind: "pixels", width: 1024, height: 1024 },
+  n: 1,
+};
 
 function labelClass() {
   return "block text-xs font-medium text-neutral-500 mb-1";
@@ -94,103 +75,89 @@ function controlClass() {
 export function Console({ models, providers }: ConsoleProps) {
   const hasKey = useMemo(() => {
     const map = new Map(providers.map((p) => [p.providerId, p.hasKey]));
-    return (id: ProviderId) => map.get(id) ?? false;
+    return (id: ModelDescriptor["providerId"]) => map.get(id) ?? false;
   }, [providers]);
 
-  const [mode, setMode] = useState<Mode>("t2i");
+  // The draft *is* the outgoing request (minus ref inputs, which are Files
+  // until submit). No mirror state to keep in sync with the capability metadata
+  // — @/providers/request answers "what does this model accept" (SPEC §7).
+  const [draft, setDraft] = useState<GenerateRequest>(() => {
+    const first = models.find((m) => m.capabilities.modes.includes("t2i") && hasKey(m.providerId)) ?? models[0];
+    return first ? defaultRequestFor(first, { mode: "t2i" }) : BLANK_DRAFT;
+  });
+
+  const model = useMemo(() => models.find((m) => m.id === draft.modelId), [models, draft.modelId]);
 
   // Models usable in the current mode with a configured key.
   const availableModels = useMemo(
-    () => models.filter((m) => m.capabilities.modes.includes(mode) && hasKey(m.providerId)),
-    [models, mode, hasKey],
+    () => models.filter((m) => m.capabilities.modes.includes(draft.mode) && hasKey(m.providerId)),
+    [models, draft.mode, hasKey],
   );
 
-  const [modelId, setModelId] = useState<string>(() => availableModels[0]?.id ?? models[0]?.id ?? "");
-  const model = useMemo(() => models.find((m) => m.id === modelId), [models, modelId]);
-
-  // Keep selection valid when mode/keys change.
-  useEffect(() => {
-    if (!availableModels.some((m) => m.id === modelId)) {
-      setModelId(availableModels[0]?.id ?? "");
-    }
-  }, [availableModels, modelId]);
-
-  const [prompt, setPrompt] = useState("");
+  // Free-form pixel entry is UI state: a custom size that happens to equal a
+  // preset shouldn't flip the control back on its own.
+  const [useCustom, setUseCustom] = useState(false);
   const [refInputs, setRefInputs] = useState<RefInput[]>([]);
 
-  // Size + params (reset when the model changes, in the effect below).
-  const [pixelSize, setPixelSize] = useState("1024x1024");
-  const [useCustom, setUseCustom] = useState(false);
-  const [customW, setCustomW] = useState(1024);
-  const [customH, setCustomH] = useState(1024);
-  const [aspectRatio, setAspectRatio] = useState<AspectRatio>("1:1");
-  const [imageSize, setImageSize] = useState<ImageSizeTier>("1K");
-  const [quality, setQuality] = useState<Quality>("high");
-  const [n, setN] = useState(1);
-  const [outputFormat, setOutputFormat] = useState<OutputFormat>("png");
-  const [providerParams, setProviderParams] = useState<Record<string, string | number | boolean>>({});
+  /** Patch the draft. Fields the model can't take are fixed on the next switch. */
+  const patch = (fields: Partial<GenerateRequest>) => setDraft((d) => ({ ...d, ...fields }));
 
-  // Reset controls to the selected model's defaults.
+  /** Patch and re-fit to the current model — for controls with a hard range (n). */
+  const patchClamped = (fields: Partial<GenerateRequest>) =>
+    setDraft((d) => (model ? clampRequest(model, { ...d, ...fields }) : { ...d, ...fields }));
+
+  /** Switch model, keeping every setting the new one still accepts. */
+  function selectModel(next: ModelDescriptor) {
+    const clamped = clampRequest(next, draft);
+    setDraft(clamped);
+    setUseCustom(
+      clamped.sizeSpec.kind === "pixels" &&
+        Boolean(next.capabilities.pixelBounds) &&
+        !next.capabilities.pixelSizes?.includes(
+          pixelSizeKey(clamped.sizeSpec.width, clamped.sizeSpec.height),
+        ),
+    );
+  }
+
+  // Keep the selection valid when mode or keys change.
   useEffect(() => {
-    if (!model) return;
-    const caps = model.capabilities;
-    setPixelSize(caps.pixelSizes?.[0] ?? "1024x1024");
-    setUseCustom(false);
-    setAspectRatio(caps.aspectRatios?.[0] ?? "1:1");
-    setImageSize(caps.imageSizeTiers?.[0] ?? "1K");
-    setQuality(caps.qualities?.includes("high") ? "high" : (caps.qualities?.[0] ?? "high"));
-    setOutputFormat(caps.outputFormats[0] ?? "png");
-    setN(1);
-    const defaults: Record<string, string | number | boolean> = {};
-    for (const p of caps.extraParams ?? []) {
-      if (p.type === "enum" && p.default !== undefined) defaults[p.key] = p.default;
-      if (p.type === "boolean" && p.default !== undefined) defaults[p.key] = p.default;
-    }
-    setProviderParams(defaults);
-  }, [model]);
+    if (availableModels.some((m) => m.id === draft.modelId)) return;
+    const next = availableModels[0];
+    if (next) selectModel(next);
+    else if (draft.modelId !== "") patch({ modelId: "" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableModels, draft.modelId]);
 
-  const sizeSpec: SizeSpec | undefined = useMemo(() => {
-    if (!model) return undefined;
-    if (model.capabilities.sizeSpecKind === "pixels") {
-      if (useCustom) return { kind: "pixels", width: customW, height: customH };
-      const [w, h] = pixelSize.split("x").map(Number);
-      return { kind: "pixels", width: w ?? 1024, height: h ?? 1024 };
-    }
-    return { kind: "ratio", aspectRatio, imageSize };
-  }, [model, useCustom, customW, customH, pixelSize, aspectRatio, imageSize]);
+  const maxN = model ? effectiveMaxN(model) : 1;
+  const pixels = draft.sizeSpec.kind === "pixels" ? draft.sizeSpec : undefined;
+  const ratio = draft.sizeSpec.kind === "ratio" ? draft.sizeSpec : undefined;
+  const params = (draft.providerParams ?? {}) as Record<string, ParamValue>;
 
-  const maxN = model ? (model.capabilities.supportsN ? model.capabilities.maxN : MAX_FANOUT_N) : 1;
+  const estimate = useMemo(() => (model ? estimateCostUSD(model, draft) : undefined), [model, draft]);
 
-  const request: GenerateRequest | undefined = useMemo(() => {
-    if (!model || !sizeSpec) return undefined;
-    const caps = model.capabilities;
-    const cleanedParams: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(providerParams)) {
-      if (v !== "" && v !== undefined) cleanedParams[k] = v;
-    }
-    return {
-      providerId: model.providerId,
-      modelId: model.id,
-      mode,
-      prompt,
-      sizeSpec,
-      n,
-      ...(caps.qualities ? { quality } : {}),
-      outputFormat,
-      ...(Object.keys(cleanedParams).length ? { providerParams: cleanedParams } : {}),
-    };
-  }, [model, sizeSpec, mode, prompt, n, quality, outputFormat, providerParams]);
+  /** Provider-private param: an emptied field drops the key entirely. */
+  function setParam(key: string, value: ParamValue) {
+    const next: Record<string, unknown> = { ...draft.providerParams };
+    if (value === "") delete next[key];
+    else next[key] = value;
+    patch({ providerParams: next });
+  }
 
-  const estimate = useMemo(
-    () => (model && request ? estimateCostUSD(model, request) : undefined),
-    [model, request],
-  );
+  /** Leaving free-form entry snaps an off-list size back to a preset. */
+  function toggleCustom(on: boolean) {
+    setUseCustom(on);
+    if (on || !pixels) return;
+    const caps = model?.capabilities;
+    if (caps?.pixelSizes?.includes(pixelSizeKey(pixels.width, pixels.height))) return;
+    const preset = parsePixelSize(caps?.pixelSizes?.[0]);
+    if (preset) patch({ sizeSpec: preset });
+  }
 
   // Submission
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<ApiError | null>(null);
-  const [result, setResult] = useState<GenResult | null>(null);
+  const [result, setResult] = useState<WireGenerationDetail | null>(null);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [deleting, setDeleting] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -202,20 +169,19 @@ export function Console({ models, providers }: ConsoleProps) {
 
   // Pick up an image handed over from the gallery ("用作参考图").
   useEffect(() => {
-    const pending = sessionStorage.getItem(PENDING_REF_KEY);
+    const pending = takePendingRef();
     if (pending) {
-      sessionStorage.removeItem(PENDING_REF_KEY);
-      setMode("reference");
+      patch({ mode: "reference" });
       addRefUrl(pending);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canGenerate = Boolean(model && request && prompt.trim() && !loading &&
-    (mode !== "reference" || refInputs.length > 0));
+  const canGenerate = Boolean(model && draft.prompt.trim() && !loading &&
+    (draft.mode !== "reference" || refInputs.length > 0));
 
   async function generate() {
-    if (!model || !request) return;
+    if (!model) return;
     setLoading(true);
     setError(null);
     setResult(null);
@@ -224,74 +190,58 @@ export function Console({ models, providers }: ConsoleProps) {
     timerRef.current = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 500);
 
     try {
-      const refImages =
-        mode === "reference"
+      const refImages: RefImage[] | undefined =
+        draft.mode === "reference"
           ? await Promise.all(
               refInputs.map(async (r) => {
                 if (r.kind === "file") {
                   return { data: await blobToBase64(r.file), mimeType: r.file.type || "image/png" };
                 }
-                const blob = await (await fetch(r.url)).blob();
-                return { data: await blobToBase64(blob), mimeType: blob.type || "image/png" };
+                return refImageFromUrl(r.url);
               }),
             )
           : undefined;
 
-      const res = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...request, ...(refImages ? { refImages } : {}) }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setError(json.error ?? { code: "error", message: "Request failed" });
-      } else {
-        setResult(json as GenResult);
-      }
+      setResult(await postGenerate(draft, refImages));
     } catch (e) {
-      setError({ code: "network", message: e instanceof Error ? e.message : "Network error" });
+      setError(
+        e instanceof ApiError
+          ? e
+          : new ApiError({ code: "error", message: e instanceof Error ? e.message : "生成失败" }, 0),
+      );
     } finally {
       if (timerRef.current) clearInterval(timerRef.current);
       setLoading(false);
     }
   }
 
-  // Download the currently-previewed image to disk (client-side blob).
-  async function downloadCurrent(img: GenImage) {
-    const res = await fetch(mediaUrl(img.filePath));
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    try {
-      const ext = img.mimeType.split("/")[1] ?? "png";
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${result?.generationId ?? "image"}-${img.idx}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } finally {
-      URL.revokeObjectURL(url);
-    }
+  async function downloadCurrent(img: WireImage) {
+    const ext = img.mimeType.split("/")[1] ?? "png";
+    await downloadImage(img.filePath, `${result?.id ?? "image"}-${img.idx}.${ext}`);
   }
 
-  // Delete the whole generation record (endpoint owned by another teammate).
   async function deleteCurrent() {
     if (!result || deleting) return;
     setDeleting(true);
     try {
-      const res = await fetch(`/api/generations/${result.generationId}`, { method: "DELETE" });
-      if (res.ok) setResult(null);
+      await deleteGeneration(result.id);
+      setResult(null);
+    } catch (e) {
+      setError(
+        e instanceof ApiError
+          ? e
+          : new ApiError({ code: "error", message: e instanceof Error ? e.message : "删除失败" }, 0),
+      );
     } finally {
       setDeleting(false);
     }
   }
 
   // Fill the prompt (and default model, if usable in the current mode) from a template.
-  function applyTemplate(t: PromptTemplate) {
-    setPrompt(t.body);
-    if (t.defaultModelId && availableModels.some((m) => m.id === t.defaultModelId)) {
-      setModelId(t.defaultModelId);
-    }
+  function applyTemplate(t: WirePromptTemplate) {
+    patch({ prompt: t.body });
+    const target = availableModels.find((m) => m.id === t.defaultModelId);
+    if (target) selectModel(target);
   }
 
   function addRefFiles(files: File[]) {
@@ -324,13 +274,14 @@ export function Console({ models, providers }: ConsoleProps) {
   }
 
   // Feed a generated image back in as a reference, and switch to reference mode.
-  function useAsReference(img: GenImage) {
+  function useAsReference(img: WireImage) {
     addRefUrl(mediaUrl(img.filePath));
-    setMode("reference");
+    patch({ mode: "reference" });
   }
 
   const caps = model?.capabilities;
   const currentImage = result?.images[selectedIdx] ?? result?.images[0];
+  const partialFailure = partialFailureCode(result?.errorCode);
 
   return (
     <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[380px_1fr]">
@@ -343,10 +294,10 @@ export function Console({ models, providers }: ConsoleProps) {
             {(["t2i", "reference"] as Mode[]).map((m) => (
               <button
                 key={m}
-                onClick={() => setMode(m)}
+                onClick={() => patch({ mode: m })}
                 className={
                   "rounded-md px-3 py-1 text-sm " +
-                  (mode === m ? "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900" : "text-neutral-500")
+                  (draft.mode === m ? "bg-neutral-900 text-white dark:bg-white dark:text-neutral-900" : "text-neutral-500")
                 }
               >
                 {m === "t2i" ? "文生图" : "参考图"}
@@ -358,7 +309,14 @@ export function Console({ models, providers }: ConsoleProps) {
         {/* Model */}
         <div>
           <span className={labelClass()}>Model</span>
-          <select className={controlClass()} value={modelId} onChange={(e) => setModelId(e.target.value)}>
+          <select
+            className={controlClass()}
+            value={draft.modelId}
+            onChange={(e) => {
+              const next = models.find((m) => m.id === e.target.value);
+              if (next) selectModel(next);
+            }}
+          >
             {availableModels.length === 0 && <option value="">该模式无可用模型</option>}
             {availableModels.map((m) => (
               <option key={m.id} value={m.id}>
@@ -377,9 +335,9 @@ export function Console({ models, providers }: ConsoleProps) {
 
         {/* Prompt templates / favorites */}
         <TemplateBar
-          currentPrompt={prompt}
+          currentPrompt={draft.prompt}
           currentProviderId={model?.providerId}
-          currentModelId={modelId}
+          currentModelId={draft.modelId}
           onApply={applyTemplate}
         />
 
@@ -389,13 +347,13 @@ export function Console({ models, providers }: ConsoleProps) {
           <textarea
             className={controlClass() + " min-h-[90px] resize-y"}
             placeholder="描述你想要的图像…"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
+            value={draft.prompt}
+            onChange={(e) => patch({ prompt: e.target.value })}
           />
         </div>
 
         {/* Reference images */}
-        {mode === "reference" && (
+        {draft.mode === "reference" && (
           <div>
             <span className={labelClass()}>参考图（≤{caps?.maxRefImages ?? 1}）</span>
             {refInputs.length > 0 && (
@@ -439,22 +397,31 @@ export function Console({ models, providers }: ConsoleProps) {
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2">
               <span className={labelClass()}>尺寸</span>
-              {caps.arbitraryPixelSize && (
+              {caps.pixelBounds && (
                 <label className="mb-1.5 flex items-center gap-1.5 text-xs text-neutral-500">
-                  <input type="checkbox" checked={useCustom} onChange={(e) => setUseCustom(e.target.checked)} />
-                  自定义尺寸
+                  <input type="checkbox" checked={useCustom} onChange={(e) => toggleCustom(e.target.checked)} />
+                  自定义尺寸（{caps.pixelBounds.min}–{caps.pixelBounds.max}px）
                 </label>
               )}
-              {useCustom ? (
+              {useCustom && caps.pixelBounds ? (
                 <div className="flex items-center gap-2">
-                  <input type="number" className={controlClass()} value={customW} min={256} max={3840}
-                    onChange={(e) => setCustomW(Number(e.target.value))} />
+                  <input type="number" className={controlClass()} value={pixels?.width ?? 1024}
+                    min={caps.pixelBounds.min} max={caps.pixelBounds.max}
+                    onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: Number(e.target.value), height: pixels?.height ?? 1024 } })} />
                   <span className="text-neutral-400">×</span>
-                  <input type="number" className={controlClass()} value={customH} min={256} max={3840}
-                    onChange={(e) => setCustomH(Number(e.target.value))} />
+                  <input type="number" className={controlClass()} value={pixels?.height ?? 1024}
+                    min={caps.pixelBounds.min} max={caps.pixelBounds.max}
+                    onChange={(e) => patch({ sizeSpec: { kind: "pixels", width: pixels?.width ?? 1024, height: Number(e.target.value) } })} />
                 </div>
               ) : (
-                <select className={controlClass()} value={pixelSize} onChange={(e) => setPixelSize(e.target.value)}>
+                <select
+                  className={controlClass()}
+                  value={pixels ? pixelSizeKey(pixels.width, pixels.height) : ""}
+                  onChange={(e) => {
+                    const preset = parsePixelSize(e.target.value);
+                    if (preset) patch({ sizeSpec: preset });
+                  }}
+                >
                   {caps.pixelSizes?.map((s) => (
                     <option key={s} value={s}>{s}</option>
                   ))}
@@ -464,7 +431,7 @@ export function Console({ models, providers }: ConsoleProps) {
             {caps.qualities && (
               <div>
                 <span className={labelClass()}>质量</span>
-                <select className={controlClass()} value={quality} onChange={(e) => setQuality(e.target.value as Quality)}>
+                <select className={controlClass()} value={draft.quality ?? ""} onChange={(e) => patch({ quality: e.target.value as Quality })}>
                   {caps.qualities.map((q) => (
                     <option key={q} value={q}>{q}</option>
                   ))}
@@ -473,15 +440,21 @@ export function Console({ models, providers }: ConsoleProps) {
             )}
             <div>
               <span className={labelClass()}>张数 n</span>
-              <input type="number" className={controlClass()} value={n} min={1} max={maxN}
-                onChange={(e) => setN(Math.max(1, Math.min(maxN, Number(e.target.value))))} />
+              <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
+                onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
             </div>
           </div>
         ) : caps?.sizeSpecKind === "ratio" ? (
           <div className="grid grid-cols-2 gap-3">
             <div>
               <span className={labelClass()}>宽高比</span>
-              <select className={controlClass()} value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value as AspectRatio)}>
+              <select
+                className={controlClass()}
+                value={ratio?.aspectRatio ?? ""}
+                onChange={(e) =>
+                  ratio && patch({ sizeSpec: { ...ratio, aspectRatio: e.target.value as AspectRatio } })
+                }
+              >
                 {caps.aspectRatios?.map((a) => (
                   <option key={a} value={a}>{a}</option>
                 ))}
@@ -489,7 +462,13 @@ export function Console({ models, providers }: ConsoleProps) {
             </div>
             <div>
               <span className={labelClass()}>分辨率</span>
-              <select className={controlClass()} value={imageSize} onChange={(e) => setImageSize(e.target.value as ImageSizeTier)}>
+              <select
+                className={controlClass()}
+                value={ratio?.imageSize ?? ""}
+                onChange={(e) =>
+                  ratio && patch({ sizeSpec: { ...ratio, imageSize: e.target.value as ImageSizeTier } })
+                }
+              >
                 {caps.imageSizeTiers?.map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
@@ -497,8 +476,8 @@ export function Console({ models, providers }: ConsoleProps) {
             </div>
             <div>
               <span className={labelClass()}>张数 n</span>
-              <input type="number" className={controlClass()} value={n} min={1} max={maxN}
-                onChange={(e) => setN(Math.max(1, Math.min(maxN, Number(e.target.value))))} />
+              <input type="number" className={controlClass()} value={draft.n ?? 1} min={1} max={maxN}
+                onChange={(e) => patchClamped({ n: Number(e.target.value) })} />
             </div>
           </div>
         ) : null}
@@ -507,7 +486,7 @@ export function Console({ models, providers }: ConsoleProps) {
         {caps && caps.outputFormats.length > 1 && (
           <div>
             <span className={labelClass()}>输出格式</span>
-            <select className={controlClass()} value={outputFormat} onChange={(e) => setOutputFormat(e.target.value as OutputFormat)}>
+            <select className={controlClass()} value={draft.outputFormat ?? ""} onChange={(e) => patch({ outputFormat: e.target.value as OutputFormat })}>
               {caps.outputFormats.map((f) => (
                 <option key={f} value={f}>{f}</option>
               ))}
@@ -522,8 +501,8 @@ export function Console({ models, providers }: ConsoleProps) {
               <ExtraParamField
                 key={p.key}
                 schema={p}
-                value={providerParams[p.key]}
-                onChange={(v) => setProviderParams((prev) => ({ ...prev, [p.key]: v }))}
+                value={params[p.key]}
+                onChange={(v) => setParam(p.key, v)}
               />
             ))}
           </div>
@@ -613,6 +592,14 @@ export function Console({ models, providers }: ConsoleProps) {
               </div>
             )}
 
+            {/* Partial fan-out failure — billed siblings were kept (SPEC §3). */}
+            {partialFailure && (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+                请求了 {result.nRequested} 张,成功 {result.images.length} 张（{partialFailure}）。
+                已出的图与费用已记录。
+              </div>
+            )}
+
             {/* Result meta */}
             <div className="rounded-lg border border-neutral-200 p-3 text-xs text-neutral-500 dark:border-neutral-800">
               <span className="font-medium text-neutral-700 dark:text-neutral-300">{result.modelId}</span>
@@ -620,7 +607,7 @@ export function Console({ models, providers }: ConsoleProps) {
               {currentImage.width && currentImage.height ? `${currentImage.width}×${currentImage.height}` : "—"}
               {result.images.length > 1 && ` · 第 ${selectedIdx + 1}/${result.images.length} 张`}
               {" · "}
-              {result.timingMs ? `${(result.timingMs / 1000).toFixed(1)}s` : "—"}
+              {fmtDuration(result.timingMs)}
               {" · "}
               实际 {fmtUsd(result.costUsd)}
               {result.costSource ? ` (${result.costSource})` : ""}

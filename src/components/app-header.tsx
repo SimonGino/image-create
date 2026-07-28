@@ -4,20 +4,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { UsageChip } from "@/components/usage-chip";
-import type { ProviderId } from "@/providers/types";
-
-interface ProviderStatus {
-  providerId: ProviderId;
-  hasKey: boolean;
-}
+import type { ProviderKeyStatus } from "@/lib/api/wire";
 
 const TABS = [
   { href: "/", label: "生成" },
   { href: "/compare", label: "对比" },
   { href: "/gallery", label: "图库" },
+  { href: "/history", label: "记录" },
 ];
 
-export function AppHeader({ providers }: { providers: ProviderStatus[] }) {
+export function AppHeader({ providers }: { providers: ProviderKeyStatus[] }) {
   const pathname = usePathname();
 
   return (
