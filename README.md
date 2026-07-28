@@ -91,8 +91,9 @@ above the abstraction changes.
 ## Optional follow-ups
 
 - **Production build check** — `npm run build` once (verifies deployability).
-- **Confirm the flash-lite id** — `gpt-image-2`, `gemini-3-pro-image-preview`,
-  and `gemini-3.1-flash-image-preview` are verified on the current relay; the
-  `gemini-3.1-flash-lite-image` id is still unconfirmed and may differ.
+- **Model list** — the three shipped ids (`gpt-image-2`,
+  `gemini-3-pro-image-preview`, `gemini-3.1-flash-image-preview`) are all
+  verified on the current relay. Older/cheaper ids were dropped on purpose;
+  past Generations keep the id and cost they were recorded with.
 - **Mask editing** (OpenAI) and **shadcn/ui** polish — supported by the
   abstraction / stack but not surfaced in the UI yet.
