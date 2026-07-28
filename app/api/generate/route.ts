@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { getGeneration } from "@/lib/generation-store";
 import { parseGenerateRequest } from "@/lib/request-schema";
 import { httpStatusForCode, ImageProviderError, ValidationError } from "@/providers/errors";
 import { runGeneration } from "@/services/generation";
@@ -30,7 +31,16 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const summary = await runGeneration(req);
-    return Response.json(summary, { status: 200 });
+    // Read the persisted Generation back through the same loader the detail
+    // route uses, so both endpoints return one identical wire shape.
+    const detail = getGeneration(summary.generationId);
+    if (!detail) {
+      return Response.json(
+        { error: { code: "internal", message: "Generation vanished after writing" } },
+        { status: 500 },
+      );
+    }
+    return Response.json(detail, { status: 200 });
   } catch (err) {
     if (err instanceof ValidationError) {
       return Response.json(

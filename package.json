@@ -11,7 +11,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "smoke": "DATA_DIR=.smoke-data tsx scripts/smoke.ts"
+    "smoke": "DATA_DIR=.smoke-data tsx scripts/smoke.ts",
+    "test": "rm -rf .test-data && DATA_DIR=.test-data IMAGE_CREATE_CONFIG=.test-data/config.json tsx --test scripts/pricing.test.ts scripts/request.test.ts scripts/validate.test.ts scripts/credentials.test.ts scripts/store.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.12.0",

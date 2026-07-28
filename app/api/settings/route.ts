@@ -1,40 +1,40 @@
 import { z } from "zod";
 
-import { readConfigStore, writeConfigStore } from "@/lib/config-store";
-import { getProviderCredentials } from "@/lib/credentials";
-import type { ProviderId } from "@/providers/types";
+import type { WireProviderSetting } from "@/lib/api/wire";
+import {
+  getProviderCredentials,
+  storedCredentials,
+  updateStoredCredentials,
+} from "@/lib/credentials";
+import { PROVIDER_IDS } from "@/providers/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const PROVIDERS: ProviderId[] = ["openai", "google"];
-
 /** Never return the raw key — only whether one exists + a last-4 mask. */
-function mask(key: string | undefined): string | null {
-  if (!key) return null;
+function mask(key: string | undefined): string | undefined {
+  if (!key) return undefined;
   return key.length >= 4 ? `····${key.slice(-4)}` : "····";
 }
 
 export function GET(): Response {
   const effective = getProviderCredentials(); // env + file merged
-  const store = readConfigStore();
+  const stored = storedCredentials(); // file only — i.e. what Settings can edit
 
-  const providers = PROVIDERS.map((id) => {
-    const eff = effective[id];
-    return {
-      providerId: id,
-      hasKey: Boolean(eff?.apiKey),
-      keyMasked: mask(eff?.apiKey),
-      baseUrl: eff?.baseUrl ?? "",
-      keyInFile: Boolean(store.providers[id]?.apiKey), // whether Settings can edit/clear it
-    };
-  });
+  const providers: WireProviderSetting[] = PROVIDER_IDS.map((id) => ({
+    providerId: id,
+    hasKey: Boolean(effective[id]?.apiKey),
+    keyMasked: mask(effective[id]?.apiKey),
+    baseUrl: effective[id]?.baseUrl ?? "",
+    keyInFile: Boolean(stored[id]?.apiKey),
+  }));
   return Response.json({ providers });
 }
 
+/** `""` and `null` are meaningful — see updateStoredCredentials for what each means. */
 const providerUpdate = z.object({
-  apiKey: z.string().nullable().optional(), // string=set, ""=leave, null=clear, undefined=leave
-  baseUrl: z.string().nullable().optional(), // string=set, ""/null=clear, undefined=leave
+  apiKey: z.string().nullable().optional(),
+  baseUrl: z.string().nullable().optional(),
 });
 const bodySchema = z.object({
   openai: providerUpdate.optional(),
@@ -47,25 +47,6 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: { code: "bad_request", message: "Malformed settings" } }, { status: 400 });
   }
 
-  const store = readConfigStore();
-  for (const id of PROVIDERS) {
-    const upd = parsed.data[id];
-    if (!upd) continue;
-    const entry = { ...(store.providers[id] ?? {}) };
-
-    if (upd.apiKey !== undefined) {
-      if (upd.apiKey === null) delete entry.apiKey; // explicit clear
-      else if (upd.apiKey.trim() !== "") entry.apiKey = upd.apiKey.trim(); // set (blank = leave)
-    }
-    if (upd.baseUrl !== undefined) {
-      if (upd.baseUrl === null || upd.baseUrl.trim() === "") delete entry.baseUrl;
-      else entry.baseUrl = upd.baseUrl.trim();
-    }
-
-    if (Object.keys(entry).length === 0) delete store.providers[id];
-    else store.providers[id] = entry;
-  }
-
-  writeConfigStore(store);
+  updateStoredCredentials(parsed.data);
   return Response.json({ ok: true });
 }

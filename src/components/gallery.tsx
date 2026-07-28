@@ -4,102 +4,20 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useRouter } from "next/navigation";
 
-import type { ProviderId, SizeSpec } from "@/providers/types";
-
-// ---- API shapes (mirrors /api/generations + /api/generations/[id]) ----
-
-interface GalleryImage {
-  idx: number;
-  filePath: string;
-  thumbPath: string | null;
-  width: number | null;
-  height: number | null;
-  mimeType: string;
-}
-
-interface GalleryItem {
-  id: string;
-  createdAt: string;
-  providerId: ProviderId;
-  modelId: string;
-  mode: string;
-  prompt: string;
-  sizeSpec: SizeSpec;
-  status: string;
-  costUsd: number | null;
-  costSource: string | null;
-  timingMs: number | null;
-  imageOutputTokens: number | null;
-  images: GalleryImage[];
-}
-
-interface RefImage {
-  idx: number;
-  filePath: string;
-  role: string;
-}
-
-interface GalleryDetail extends GalleryItem {
-  quality: string | null;
-  outputFormat: string | null;
-  nRequested: number;
-  providerParams: Record<string, unknown> | null;
-  errorCode: string | null;
-  textInputTokens: number | null;
-  imageInputTokens: number | null;
-  refImages: RefImage[];
-}
-
-// ---- helpers ----
-
-/** stored path is "data/images/{id}/{file}"; the media route serves under images/. */
-function mediaUrl(filePath: string): string {
-  return "/api/images/" + filePath.replace(/^data\/images\//, "");
-}
-
-function fmtUsd(v: number | null | undefined): string {
-  return v === null || v === undefined ? "—" : `$${v.toFixed(3)}`;
-}
-
-function fmtSize(s: SizeSpec): string {
-  return s.kind === "pixels" ? `${s.width}×${s.height}` : `${s.aspectRatio} · ${s.imageSize}`;
-}
-
-function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function fmtDuration(ms: number | null): string {
-  return ms ? `${(ms / 1000).toFixed(1)}s` : "—";
-}
-
-function modeLabel(m: string): string {
-  return m === "t2i" ? "文生图" : m === "reference" ? "参考图" : m;
-}
-
-async function downloadImage(filePath: string, filename: string): Promise<void> {
-  const res = await fetch(mediaUrl(filePath));
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-// Must match console.tsx: hands a gallery image to the console as a reference.
-const PENDING_REF_KEY = "imageCreate:pendingRef";
+import {
+  deleteGeneration,
+  downloadImage,
+  getGeneration,
+  listGenerations,
+  mediaUrl,
+} from "@/lib/api/client";
+import {
+  partialFailureCode,
+  type WireGenerationDetail,
+  type WireGenerationRow,
+} from "@/lib/api/wire";
+import { fmtDate, fmtDuration, fmtSize, fmtUsd, modeLabel } from "@/lib/format";
+import { stashPendingRef } from "@/lib/pending-ref";
 
 const labelClass = "block text-xs font-medium text-neutral-500 mb-1";
 const controlClass =
@@ -118,7 +36,7 @@ const MODE_OPTIONS: { value: string; label: string }[] = [
 ];
 
 export function Gallery() {
-  const [items, setItems] = useState<GalleryItem[]>([]);
+  const [items, setItems] = useState<WireGenerationRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -127,7 +45,7 @@ export function Gallery() {
   const [mode, setMode] = useState("all");
 
   const [detailId, setDetailId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<GalleryDetail | null>(null);
+  const [detail, setDetail] = useState<WireGenerationDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -135,10 +53,8 @@ export function Gallery() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/generations?limit=200");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = (await res.json()) as { generations: GalleryItem[] };
-      setItems(json.generations ?? []);
+      const { generations } = await listGenerations({ limit: 200 });
+      setItems(generations);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
@@ -181,8 +97,9 @@ export function Gallery() {
     setDetail(null);
     setDetailLoading(true);
     try {
-      const res = await fetch(`/api/generations/${id}`);
-      if (res.ok) setDetail((await res.json()) as GalleryDetail);
+      setDetail(await getGeneration(id));
+    } catch {
+      // the overlay keeps its loading-failed state; the grid is unaffected
     } finally {
       setDetailLoading(false);
     }
@@ -208,9 +125,11 @@ export function Gallery() {
       if (!window.confirm("确定删除这条生成记录?此操作不可撤销。")) return;
       setDeleting(true);
       try {
-        await fetch(`/api/generations/${id}`, { method: "DELETE" });
+        await deleteGeneration(id);
         closeDetail();
         await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "删除失败");
       } finally {
         setDeleting(false);
       }
@@ -341,21 +260,28 @@ function DetailView({
   deleting,
   onDelete,
 }: {
-  detail: GalleryDetail;
+  detail: WireGenerationDetail;
   deleting: boolean;
   onDelete: () => void;
 }) {
   const router = useRouter();
   const params = detail.providerParams;
   const hasParams = params && Object.keys(params).length > 0;
+  const partialFailure = partialFailureCode(detail.errorCode);
 
   function useAsRef(filePath: string) {
-    sessionStorage.setItem(PENDING_REF_KEY, mediaUrl(filePath));
+    stashPendingRef(mediaUrl(filePath));
     router.push("/");
   }
 
   return (
     <div className="space-y-4 pr-6">
+      {partialFailure && (
+        <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+          请求了 {detail.nRequested} 张,成功 {detail.images.length} 张（{partialFailure}）。
+        </div>
+      )}
+
       {/* Images */}
       {detail.images.length > 0 ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -454,13 +380,16 @@ function DetailView({
       <div className="rounded-lg border border-neutral-200 p-3 text-xs text-neutral-500 dark:border-neutral-800">
         <div className="flex flex-wrap gap-x-4 gap-y-1">
           <span>
-            文本输入 <b className="text-neutral-700 dark:text-neutral-300">{detail.textInputTokens ?? "—"}</b> tok
+            文本输入{" "}
+            <b className="text-neutral-700 dark:text-neutral-300">{detail.usage.textInputTokens ?? "—"}</b> tok
           </span>
           <span>
-            图像输入 <b className="text-neutral-700 dark:text-neutral-300">{detail.imageInputTokens ?? "—"}</b> tok
+            图像输入{" "}
+            <b className="text-neutral-700 dark:text-neutral-300">{detail.usage.imageInputTokens ?? "—"}</b> tok
           </span>
           <span>
-            图像输出 <b className="text-neutral-700 dark:text-neutral-300">{detail.imageOutputTokens ?? "—"}</b> tok
+            图像输出{" "}
+            <b className="text-neutral-700 dark:text-neutral-300">{detail.usage.imageOutputTokens ?? "—"}</b> tok
           </span>
           <span>
             实际成本{" "}

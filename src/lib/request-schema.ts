@@ -1,12 +1,12 @@
 /**
  * Structural validation for the untrusted API boundary (zod). Capability-level
- * checks (size membership, n limits, ...) happen later in the adapter's
- * validate(); this just guarantees the shape before we touch the DB.
+ * checks (size membership, n limits, ...) belong to
+ * @/providers/validate — this just guarantees the shape before we touch the DB.
  */
 
 import { z } from "zod";
 
-import type { GenerateRequest } from "@/providers/types";
+import { PROVIDER_IDS, type GenerateRequest } from "@/providers/types";
 
 const aspectRatio = z.enum([
   "1:1",
@@ -42,7 +42,7 @@ const refImage = z.object({
 });
 
 export const generateRequestSchema = z.object({
-  providerId: z.enum(["openai", "google"]),
+  providerId: z.enum(PROVIDER_IDS),
   modelId: z.string().min(1),
   mode: z.enum(["t2i", "reference"]),
   prompt: z.string(),

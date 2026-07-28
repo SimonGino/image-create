@@ -1,22 +1,29 @@
 /**
- * Cost & usage math (SPEC §6). Two figures:
+ * Cost & usage math (SPEC §6) — the app's only cost owner. Two figures:
  *   - estimate (pre-flight, "≈$"): from pricing metadata + chosen size/quality/n.
+ *     Shown in the console/compare panels and written on the pending row.
  *   - actual: from the usage tokens the provider returns — the statistics
  *     source of truth (cost_source = 'actual').
+ *
+ * Dollars are derived here and nowhere else. Adapters return usage *tokens*;
+ * the rates live in the app-owned `ModelDescriptor`, so an adapter pricing its
+ * own call would be deciding something it doesn't own — and the orchestrator,
+ * holding the same model + usage, would compute the identical number anyway.
+ *
+ * `resolveCost` owns which of the two figures gets persisted, so `cost_usd`
+ * and `cost_source` cannot drift apart at a call site.
  *
  * Currency USD, rounded to $0.001.
  */
 
+import { pixelSizeKey } from "./request";
 import type { GenerateRequest, GenerationUsage, ModelDescriptor, Quality } from "./types";
 
 export type CostSource = "estimated" | "actual";
 
-function round3(usd: number): number {
+/** The app's single USD rounding — $0.001 precision. */
+export function round3(usd: number): number {
   return Math.round(usd * 1000) / 1000;
-}
-
-function sizeKey(width: number, height: number): string {
-  return `${width}x${height}`;
 }
 
 /** Quality to price at when the request leaves it unset/auto — upper-bound so "≈$" never under-quotes. */
@@ -34,7 +41,7 @@ export function estimateCostUSD(model: ModelDescriptor, req: GenerateRequest): n
   const { pricing } = model;
 
   if (req.sizeSpec.kind === "pixels") {
-    const key = sizeKey(req.sizeSpec.width, req.sizeSpec.height);
+    const key = pixelSizeKey(req.sizeSpec.width, req.sizeSpec.height);
     const quality = qualityForEstimate(req.quality);
 
     const tableUSD = pricing.perImageTable?.[`${key}:${quality}`];
@@ -54,13 +61,14 @@ export function estimateCostUSD(model: ModelDescriptor, req: GenerateRequest): n
 }
 
 /**
- * Actual cost from returned usage tokens (SPEC §6 algorithm). This is what gets
- * persisted as cost_usd with cost_source='actual'.
+ * Actual cost from returned usage tokens (SPEC §6 algorithm).
+ *
+ * Module-private: callers want the *persisted* figure, which is a decision
+ * about actual-vs-estimate — that's `resolveCost`. Linear in every token count,
+ * which is why fan-out can be priced once from the summed usage instead of
+ * per shot.
  */
-export function actualCostFromUsage(
-  model: ModelDescriptor,
-  usage: GenerationUsage,
-): number | undefined {
+function actualCostFromUsage(model: ModelDescriptor, usage: GenerationUsage): number | undefined {
   const { pricing } = model;
   const out = usage.imageOutputTokens;
   if (out === undefined) return undefined;
@@ -75,4 +83,29 @@ export function actualCostFromUsage(
     1e6;
 
   return round3(usd);
+}
+
+/** What gets persisted on a Generation: the figure and where it came from. */
+export interface CostDecision {
+  costUsd?: number;
+  costSource?: CostSource;
+}
+
+/**
+ * The cost a finished Generation is recorded with (SPEC §6): returned usage
+ * tokens win; the pre-flight `estimate` stands when the provider gave no usable
+ * token counts; neither means the Generation carries no cost at all.
+ *
+ * The pair is returned together so no caller can set a source that its figure
+ * doesn't support.
+ */
+export function resolveCost(
+  model: ModelDescriptor,
+  usage: GenerationUsage,
+  estimate: number | undefined,
+): CostDecision {
+  const actual = actualCostFromUsage(model, usage);
+  if (actual !== undefined) return { costUsd: actual, costSource: "actual" };
+  if (estimate !== undefined) return { costUsd: estimate, costSource: "estimated" };
+  return {};
 }

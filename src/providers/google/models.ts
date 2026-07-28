@@ -5,10 +5,14 @@
  * models produce ONE image per call, so "n images" is done by the orchestration
  * layer firing N concurrent generate() calls (supportsN=false / maxN=1).
  *
+ * Two models on purpose: pro for quality, flash for everything else. Flash-lite
+ * was dropped — its id was never confirmed against the relay, and flash already
+ * covers the cheap end. Old Generations keep their stored model id and cost.
+ *
  * Pricing is OFFICIAL (verified 2026-07-16):
  *   - ai.google.dev/gemini-api/docs/pricing
  *   - cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
- * Image OUTPUT token rates: 3-pro=$120/1M, 3.1-flash=$60/1M, 3.1-flash-lite=$30/1M.
+ * Image OUTPUT token rates: 3-pro=$120/1M, 3.1-flash=$60/1M.
  * INPUT tokens (text + image) bill at ~$2/1M. `perImageTable` holds the official
  * per-image $ by resolution tier (drives the pre-flight estimate); actual cost is
  * recomputed from returned usage tokens.
@@ -81,29 +85,6 @@ export const GOOGLE_MODELS: ModelDescriptor[] = [
       imageInputPerMTok: INPUT_PER_MTOK,
       textInputPerMTok: INPUT_PER_MTOK,
       perImageTable: { "0.5K": 0.045, "1K": 0.067, "2K": 0.101, "4K": 0.151 },
-    },
-  },
-  {
-    id: "gemini-3.1-flash-lite-image",
-    providerId: "google",
-    label: "Gemini 3.1 Flash Lite Image",
-    capabilities: {
-      modes: ["t2i", "reference"],
-      maxRefImages: 6,
-      supportsMask: false,
-      supportsN: false,
-      maxN: 1,
-      sizeSpecKind: "ratio",
-      aspectRatios: ALL_ASPECT_RATIOS,
-      imageSizeTiers: ["1K"] as ImageSizeTier[], // 1K only
-      outputFormats: OUTPUT_FORMATS,
-    },
-    pricing: {
-      unit: "token",
-      imageOutputPerMTok: 30, // 1120 tok → $0.034
-      imageInputPerMTok: INPUT_PER_MTOK,
-      textInputPerMTok: INPUT_PER_MTOK,
-      perImageTable: { "1K": 0.034 },
     },
   },
 ];

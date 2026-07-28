@@ -2,59 +2,29 @@
 
 import { useMemo, useState } from "react";
 
+import { generate, mediaUrl } from "@/lib/api/client";
+import type { ProviderKeyStatus, WireGenerationDetail } from "@/lib/api/wire";
+import { fmtDuration, fmtUsd } from "@/lib/format";
 import { estimateCostUSD } from "@/providers/pricing";
-import type { GenerateRequest, ModelDescriptor, ProviderId, SizeSpec } from "@/providers/types";
-
-interface ProviderStatus {
-  providerId: ProviderId;
-  hasKey: boolean;
-}
+import { defaultRequestFor } from "@/providers/request";
+import type { ModelDescriptor, ProviderId } from "@/providers/types";
 
 interface CompareProps {
   models: ModelDescriptor[];
-  providers: ProviderStatus[];
+  providers: ProviderKeyStatus[];
 }
 
-interface GenImage {
-  idx: number;
-  filePath: string;
-  width?: number;
-  height?: number;
-  mimeType: string;
-}
-interface GenResult {
-  images: GenImage[];
-  costUsd?: number;
-  costSource?: string;
-  timingMs?: number;
-  usage: { imageOutputTokens?: number };
-}
-type Cell = { status: "loading" } | { status: "done"; result: GenResult } | { status: "error"; message: string };
+type Cell =
+  | { status: "loading" }
+  | { status: "done"; result: WireGenerationDetail }
+  | { status: "error"; message: string };
 
-function mediaUrl(filePath: string): string {
-  return "/api/images/" + filePath.replace(/^data\/images\//, "");
-}
-function fmtUsd(v: number | undefined): string {
-  return v === undefined ? "—" : `$${v.toFixed(3)}`;
-}
-
-/** t2i request for a model, using its default square size. */
-function buildRequest(model: ModelDescriptor, prompt: string): GenerateRequest {
-  const sizeSpec: SizeSpec =
-    model.capabilities.sizeSpecKind === "pixels"
-      ? { kind: "pixels", width: 1024, height: 1024 }
-      : { kind: "ratio", aspectRatio: "1:1", imageSize: "1K" };
-  return {
-    providerId: model.providerId,
-    modelId: model.id,
-    mode: "t2i",
-    prompt,
-    sizeSpec,
-    n: 1,
-    ...(model.capabilities.qualities ? { quality: "high" as const } : {}),
-    outputFormat: "png",
-  };
-}
+/**
+ * One prompt per model at that model's own defaults — the comparison is only
+ * fair if every cell asks for what its model considers standard.
+ */
+const buildRequest = (model: ModelDescriptor, prompt: string) =>
+  defaultRequestFor(model, { mode: "t2i", prompt, n: 1 });
 
 const PREFERRED = ["gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"];
 
@@ -104,22 +74,12 @@ export function Compare({ models, providers }: CompareProps) {
     await Promise.all(
       chosen.map(async (m) => {
         try {
-          const res = await fetch("/api/generate", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(buildRequest(m, prompt)),
-          });
-          const json = await res.json();
-          setCells((prev) => ({
-            ...prev,
-            [m.id]: res.ok
-              ? { status: "done", result: json as GenResult }
-              : { status: "error", message: json.error?.message ?? "生成失败" },
-          }));
+          const result = await generate(buildRequest(m, prompt));
+          setCells((prev) => ({ ...prev, [m.id]: { status: "done", result } }));
         } catch (e) {
           setCells((prev) => ({
             ...prev,
-            [m.id]: { status: "error", message: e instanceof Error ? e.message : "网络错误" },
+            [m.id]: { status: "error", message: e instanceof Error ? e.message : "生成失败" },
           }));
         }
       }),
@@ -206,6 +166,10 @@ export function Compare({ models, providers }: CompareProps) {
                   <div className="flex aspect-square items-center justify-center rounded-lg border border-red-200 bg-red-50 p-3 text-center text-xs text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
                     {cell.message}
                   </div>
+                ) : cell.result.images.length === 0 ? (
+                  <div className="flex aspect-square items-center justify-center rounded-lg border border-neutral-200 text-xs text-neutral-400 dark:border-neutral-800">
+                    无图
+                  </div>
                 ) : (
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -215,7 +179,7 @@ export function Compare({ models, providers }: CompareProps) {
                       className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800"
                     />
                     <div className="text-xs text-neutral-500">
-                      {cell.result.timingMs ? `${(cell.result.timingMs / 1000).toFixed(1)}s` : "—"}
+                      {fmtDuration(cell.result.timingMs)}
                       {" · 实际 "}
                       {fmtUsd(cell.result.costUsd)}
                       {" · "}

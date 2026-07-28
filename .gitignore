@@ -18,6 +18,8 @@ next-env.d.ts
 /data/
 # smoke-test scratch DB + images (isolated from real data)
 /.smoke-data
+# store-test scratch DB — recreated fresh on every `npm run test`
+/.test-data
 
 # secrets — API keys live in .env / ~/.image-create/config.json only
 .env

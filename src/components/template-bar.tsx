@@ -2,24 +2,20 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import {
+  createTemplate,
+  deleteTemplate,
+  listTemplates,
+  updateTemplate,
+} from "@/lib/api/client";
+import type { WirePromptTemplate } from "@/lib/api/wire";
 import type { ProviderId } from "@/providers/types";
-
-export interface PromptTemplate {
-  id: string;
-  title: string;
-  body: string;
-  favorite: boolean;
-  variables?: string[] | null;
-  defaultProviderId?: ProviderId | null;
-  defaultModelId?: string | null;
-  createdAt?: string | number;
-}
 
 interface Props {
   currentPrompt: string;
   currentProviderId?: ProviderId;
   currentModelId?: string;
-  onApply: (t: PromptTemplate) => void;
+  onApply: (t: WirePromptTemplate) => void;
 }
 
 const control =
@@ -27,7 +23,7 @@ const control =
 
 /** Save / apply / favorite prompt templates (SPEC §7). Local CRUD, no generation. */
 export function TemplateBar({ currentPrompt, currentProviderId, currentModelId, onApply }: Props) {
-  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [templates, setTemplates] = useState<WirePromptTemplate[]>([]);
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [title, setTitle] = useState("");
@@ -35,9 +31,7 @@ export function TemplateBar({ currentPrompt, currentProviderId, currentModelId, 
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch("/api/prompt-templates");
-      const json = await res.json();
-      setTemplates(json.templates ?? []);
+      setTemplates(await listTemplates());
     } catch {
       // ignore — templates are non-critical
     }
@@ -51,35 +45,29 @@ export function TemplateBar({ currentPrompt, currentProviderId, currentModelId, 
     if (!currentPrompt.trim() || !title.trim() || busy) return;
     setBusy(true);
     try {
-      await fetch("/api/prompt-templates", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          title: title.trim(),
-          body: currentPrompt,
-          defaultProviderId: currentProviderId,
-          defaultModelId: currentModelId,
-        }),
+      await createTemplate({
+        title: title.trim(),
+        body: currentPrompt,
+        defaultProviderId: currentProviderId,
+        defaultModelId: currentModelId,
       });
       setTitle("");
       setSaving(false);
       await refresh();
+    } catch {
+      // ignore — templates are non-critical
     } finally {
       setBusy(false);
     }
   }
 
-  async function toggleFav(t: PromptTemplate) {
-    await fetch(`/api/prompt-templates/${t.id}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ favorite: !t.favorite }),
-    });
+  async function toggleFav(t: WirePromptTemplate) {
+    await updateTemplate(t.id, { favorite: !t.favorite });
     await refresh();
   }
 
-  async function remove(t: PromptTemplate) {
-    await fetch(`/api/prompt-templates/${t.id}`, { method: "DELETE" });
+  async function remove(t: WirePromptTemplate) {
+    await deleteTemplate(t.id);
     await refresh();
   }
 

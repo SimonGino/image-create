@@ -6,13 +6,15 @@
  * These models return ONE image per call — this adapter always yields a single
  * image; "n images" is handled upstream by concurrent calls (see the
  * orchestration fan-out). Reference inputs go in as inlineData parts; no mask.
+ *
+ * Capability rules live in the metadata (./models.ts), enforced for every
+ * provider by @/providers/validate — this file is only the call.
  */
 
 import { GoogleGenAI, type Part } from "@google/genai";
 
 import { getProviderConfig } from "@/lib/credentials";
 import { AuthError, errorFromHttpStatus, ProviderError, TimeoutError } from "@/providers/errors";
-import { actualCostFromUsage } from "@/providers/pricing";
 import type {
   GenerateRequest,
   GenerateResult,
@@ -20,14 +22,10 @@ import type {
   ImageProviderAdapter,
   ModelDescriptor,
   ProviderId,
-  ValidationIssue,
-  ValidationResult,
 } from "@/providers/types";
 import { GOOGLE_MODELS } from "./models";
 
 const REQUEST_TIMEOUT_MS = Number(process.env.GOOGLE_TIMEOUT_MS ?? 120_000);
-// App-level ceiling on client-side concurrency for "n images" (Gemini has no native n).
-const MAX_FANOUT_N = 8;
 
 interface ModalityTokens {
   modality?: unknown;
@@ -52,67 +50,6 @@ export class GoogleAdapter implements ImageProviderAdapter {
 
   private getModel(modelId: string): ModelDescriptor | undefined {
     return GOOGLE_MODELS.find((m) => m.id === modelId);
-  }
-
-  validate(req: GenerateRequest): ValidationResult {
-    const model = this.getModel(req.modelId);
-    if (!model) {
-      return {
-        ok: false,
-        issues: [{ path: "modelId", code: "unknown_model", message: `Unknown Gemini model: ${req.modelId}` }],
-      };
-    }
-    const caps = model.capabilities;
-    const issues: ValidationIssue[] = [];
-
-    if (!req.prompt || req.prompt.trim().length === 0) {
-      issues.push({ path: "prompt", code: "required", message: "Prompt is required" });
-    }
-    if (!caps.modes.includes(req.mode)) {
-      issues.push({ path: "mode", code: "unsupported_mode", message: `${model.label} does not support mode '${req.mode}'` });
-    }
-
-    // Size — Gemini is ratio-based.
-    if (req.sizeSpec.kind !== "ratio") {
-      issues.push({ path: "sizeSpec", code: "wrong_size_kind", message: "Gemini expects an aspect-ratio size" });
-    } else {
-      if (caps.aspectRatios && !caps.aspectRatios.includes(req.sizeSpec.aspectRatio)) {
-        issues.push({ path: "sizeSpec.aspectRatio", code: "unsupported_aspect", message: `Supported: ${caps.aspectRatios.join(", ")}` });
-      }
-      if (caps.imageSizeTiers && !caps.imageSizeTiers.includes(req.sizeSpec.imageSize)) {
-        issues.push({ path: "sizeSpec.imageSize", code: "unsupported_size", message: `${model.label} supports: ${caps.imageSizeTiers.join(", ")}` });
-      }
-    }
-
-    // n — the user's desired count is satisfied by client-side fan-out, so we
-    // bound it by an app ceiling rather than the provider's native maxN (=1).
-    if (req.n !== undefined) {
-      if (req.n < 1) {
-        issues.push({ path: "n", code: "min", message: "n must be ≥ 1" });
-      } else if (req.n > MAX_FANOUT_N) {
-        issues.push({ path: "n", code: "max", message: `At most ${MAX_FANOUT_N} images per request` });
-      }
-    }
-
-    // Reference images
-    if (req.mode === "reference") {
-      const refs = req.refImages ?? [];
-      if (refs.length === 0) {
-        issues.push({ path: "refImages", code: "required", message: "Reference mode needs at least one image" });
-      }
-      if (refs.length > caps.maxRefImages) {
-        issues.push({ path: "refImages", code: "too_many", message: `At most ${caps.maxRefImages} reference images` });
-      }
-      if (refs.some((r) => r.role === "mask")) {
-        issues.push({ path: "refImages", code: "no_mask", message: "Gemini does not support masks" });
-      }
-    }
-
-    if (req.outputFormat && !caps.outputFormats.includes(req.outputFormat)) {
-      issues.push({ path: "outputFormat", code: "unsupported_format", message: `Supported: ${caps.outputFormats.join(", ")}` });
-    }
-
-    return issues.length === 0 ? { ok: true } : { ok: false, issues };
   }
 
   async generate(req: GenerateRequest): Promise<GenerateResult> {
@@ -193,13 +130,7 @@ export class GoogleAdapter implements ImageProviderAdapter {
           tokensForModality(meta?.candidatesTokensDetails, "IMAGE") ?? meta?.candidatesTokenCount,
       };
 
-      return {
-        images,
-        usage,
-        costEstimateUSD: actualCostFromUsage(model, usage),
-        timingMs: Date.now() - started,
-        raw: response,
-      };
+      return { images, usage, timingMs: Date.now() - started };
     } catch (err) {
       if (err instanceof ProviderError) throw err;
 

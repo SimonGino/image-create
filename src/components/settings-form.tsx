@@ -2,32 +2,32 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-interface ProviderStatus {
-  providerId: "openai" | "google";
-  hasKey: boolean;
-  keyMasked: string | null;
-  baseUrl: string;
-  keyInFile: boolean;
-}
+import { getSettings, saveSettings } from "@/lib/api/client";
+import type { ProviderSettingUpdate, WireProviderSetting } from "@/lib/api/wire";
+import type { ProviderId } from "@/providers/types";
 
 const LABELS: Record<string, string> = { openai: "OpenAI", google: "Google Gemini" };
 const control =
   "w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 text-sm outline-none focus:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900";
 
 export function SettingsForm() {
-  const [statuses, setStatuses] = useState<ProviderStatus[]>([]);
+  const [statuses, setStatuses] = useState<WireProviderSetting[]>([]);
   const [keyInput, setKeyInput] = useState<Record<string, string>>({});
   const [baseInput, setBaseInput] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const res = await fetch("/api/settings");
-    const json = await res.json();
-    const list: ProviderStatus[] = json.providers ?? [];
-    setStatuses(list);
-    setBaseInput(Object.fromEntries(list.map((p) => [p.providerId, p.baseUrl])));
-    setKeyInput({});
+    try {
+      const list = await getSettings();
+      setStatuses(list);
+      setBaseInput(Object.fromEntries(list.map((p) => [p.providerId, p.baseUrl])));
+      setKeyInput({});
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "读取设置失败");
+    }
   }, []);
 
   useEffect(() => {
@@ -37,32 +37,34 @@ export function SettingsForm() {
   async function save() {
     setSaving(true);
     setSaved(false);
+    setError(null);
     try {
-      const body: Record<string, { apiKey?: string; baseUrl: string }> = {};
+      const updates: Partial<Record<ProviderId, ProviderSettingUpdate>> = {};
       for (const p of statuses) {
         const key = keyInput[p.providerId]?.trim();
-        body[p.providerId] = { baseUrl: baseInput[p.providerId] ?? "", ...(key ? { apiKey: key } : {}) };
+        updates[p.providerId] = {
+          baseUrl: baseInput[p.providerId] ?? "",
+          ...(key ? { apiKey: key } : {}),
+        };
       }
-      await fetch("/api/settings", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      await saveSettings(updates);
       await load();
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSaving(false);
     }
   }
 
-  async function clearKey(id: string) {
-    await fetch("/api/settings", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ [id]: { apiKey: null } }),
-    });
-    await load();
+  async function clearKey(id: ProviderId) {
+    try {
+      await saveSettings({ [id]: { apiKey: null } });
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "清除失败");
+    }
   }
 
   return (
@@ -129,6 +131,7 @@ export function SettingsForm() {
           {saving ? "保存中…" : "保存"}
         </button>
         {saved && <span className="text-sm text-green-600">已保存</span>}
+        {error && <span className="text-sm text-red-600">{error}</span>}
       </div>
     </div>
   );
