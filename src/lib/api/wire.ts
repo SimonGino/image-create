@@ -163,6 +163,8 @@ export interface WirePromptTemplate {
   variables?: string[];
   defaultProviderId?: ProviderId;
   defaultModelId?: string;
+  /** Card cover image path. May dangle after that generation is deleted. */
+  coverImagePath?: string;
   createdAt: string; // ISO-8601
 }
 
@@ -173,6 +175,7 @@ export interface PromptTemplateInput {
   variables?: string[];
   defaultProviderId?: ProviderId;
   defaultModelId?: string;
+  coverImagePath?: string;
 }
 
 export interface PromptTemplatePatch {
@@ -245,6 +248,7 @@ export function toWireTemplate(row: PromptTemplate): WirePromptTemplate {
     variables: opt(row.variables),
     defaultProviderId: opt(row.defaultProviderId),
     defaultModelId: opt(row.defaultModelId),
+    coverImagePath: opt(row.coverImagePath),
     createdAt: row.createdAt.toISOString(),
   };
 }

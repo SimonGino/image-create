@@ -94,6 +94,9 @@ export const promptTemplates = sqliteTable("prompt_templates", {
   variables: text("variables", { mode: "json" }).$type<string[]>(),
   defaultProviderId: text("default_provider_id").$type<ProviderId>(),
   defaultModelId: text("default_model_id"),
+  // Card cover — a stored generation image path; dangling after that
+  // generation is deleted, in which case the card falls back to text-only.
+  coverImagePath: text("cover_image_path"),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .$defaultFn(() => new Date()),

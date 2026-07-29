@@ -91,7 +91,8 @@ generations(id, created_at, provider_id, model_id, mode, prompt, size_spec(json)
             timing_ms, text_input_tokens, image_input_tokens, image_output_tokens, cost_usd)  -- usage 内联
 generation_images(id, generation_id, idx, file_path, thumb_path, width, height, mime_type)
 generation_ref_images(id, generation_id, idx, file_path, role('image'|'mask'))
-prompt_templates(id, title, body, favorite, variables(json), default_provider_id, default_model_id, created_at)
+prompt_templates(id, title, body, favorite, variables(json), default_provider_id, default_model_id,
+                 cover_image_path, created_at)  -- cover 指向某张生成图,该生成被删后悬空 → 卡片退化为纯文字
 ```
 
 usage v1 内联进 `generations`;要更细分析再拆 `usage_records`(带 `cost_source ∈ {estimated, actual}`)。
@@ -113,16 +114,22 @@ usage v1 内联进 `generations`;要更细分析再拆 `usage_records`(带 `cost
 - **算法**:预估 = `imageOutputTokens(size,quality) × imageOutputPerMTok/1e6 × n`(参考图模式加 `imageInputTokens`)。
 - **口径**:每条 usage 记 `cost_source ∈ {estimated,actual}`,汇总优先 actual;货币 USD、精度 $0.001。
 - **维度**:v1 做 provider / model / 月(SQLite `GROUP BY`)。
-- **呈现**:生成前(左栏)预估、结果(右栏)实际、图库 / Usage 页累计。
+- **呈现**:生成前在参数胶囊摘要与其 popover 内预估、结果区实际、图库 / Usage 页累计。
 
 ---
 
-## 7. UI · Layout 1 双栏控制台 · [ticket 06](.scratch/image-app-design/issues/06-ui-prototype.md)
+## 7. UI · 单列提示词优先控制台 · [ticket 06](.scratch/image-app-design/issues/06-ui-prototype.md)
 
-- **顶栏**:`image-create` + 「生成 / 图库」tab + 累计用量 chip + 设置。
-- **左栏(控制台)**:Mode 分段(文生图 / 参考图)→ Model 选择器 → 能力提示 → 提示词 → 参考图上传(仅参考图模式)→ **动态参数面板** → 成本预估「≈$」→ 生成按钮。
-- **右栏(预览)**:大图预览 + 本批缩略条 + 结果元信息(模型 · 尺寸 · 质量 · 耗时 · 实际 $)+ 操作(下载 / 重生 / 存模板 / 删除)。
-- **图库**:顶栏 tab 切独立视图(缩略网格,按 provider / model / mode / 时间过滤;详情 = 原图 + 参数 + 用量 + 操作)。
+> 原 Layout 1 为双栏控制台(左栏参数面板 / 右栏预览),2026-07-28 改为下述单列形态。首页始终是**唯一的生成工作台**,不是转发到别处的入口页。
+
+- **顶栏**:`image-create` + 「生成 / 对比 / 图库 / 记录」tab + 累计用量 chip + 设置。
+- **Hero**:一句标题 + 一句副标题。
+- **输入卡片(居中单列)**:提示词 → 「+」加参考图(整卡支持拖拽)→ Model 胶囊 → 参数胶囊 → 提交箭头(⌘↵)。
+- **参数胶囊**:常显「尺寸 · 张数 · ≈成本」摘要,点开 popover = **动态参数面板** + 能力提示 + 成本预估「≈$」。
+- **Mode 是派生的,不是选择的**:参考图托盘非空 → `reference`,空 → `t2i`。无显式切换控件(见 CONTEXT.md「Mode」)。
+- **结果区**:插在输入卡片与模板卡片网格之间(网格下推,不被替换)。大图预览 + 本批缩略条 + 结果元信息(模型 · 尺寸 · 耗时 · 实际 $)+ 操作(下载 / 用作参考图 / 存为模板 / 重生 / 删除)。
+- **「开始使用」卡片网格**:渲染 Prompt Templates(收藏优先、新的在前),卡片 = 标题 + 正文截断 + 封面图(无封面则纯文字)。点卡片填入提示词并切默认模型。
+- **图库 / 记录**:顶栏 tab 切独立视图(缩略网格,按 provider / model / mode / 时间过滤;详情 = 原图 + 参数 + 用量 + 操作)。
 - **动态参数面板**:OpenAI → 尺寸 / 质量 / n;Gemini → 宽高比 / 分辨率、n=1。全由第 3 节 `capabilities` 驱动。
 
 ---
