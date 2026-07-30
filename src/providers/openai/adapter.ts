@@ -105,7 +105,23 @@ export class OpenAIAdapter implements ImageProviderAdapter {
 
     try {
       const res = await this.dispatch(req, apiKey, base, controller.signal);
-      const json = (await res.json()) as OpenAIImageResponse & { error?: { message?: string } };
+      const text = await res.text();
+
+      // Proxies/relays can answer with a bare HTML error page (e.g. an nginx
+      // "504 Gateway Time-out" when a slow edit exceeds the relay's upstream
+      // timeout). Parse defensively so that surfaces as a real provider error
+      // instead of a SyntaxError escaping the taxonomy as "internal".
+      let json: OpenAIImageResponse & { error?: { message?: string } };
+      try {
+        json = JSON.parse(text) as OpenAIImageResponse & { error?: { message?: string } };
+      } catch {
+        const snippet = text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+        throw errorFromHttpStatus(
+          res.status,
+          `OpenAI endpoint returned non-JSON (HTTP ${res.status}): ${snippet || "empty body"}`,
+          { providerId: this.providerId, raw: text.slice(0, 1000) },
+        );
+      }
 
       if (!res.ok) {
         const message = json?.error?.message ?? `OpenAI request failed (${res.status})`;
