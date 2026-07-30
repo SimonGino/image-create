@@ -10,7 +10,7 @@
  * provider by @/providers/validate — this file is only the call.
  */
 
-import { Agent, fetch as undiciFetch } from "undici";
+import { Agent, fetch as undiciFetch, FormData as UndiciFormData } from "undici";
 
 import { getProviderConfig } from "@/lib/credentials";
 import {
@@ -194,7 +194,9 @@ export class OpenAIAdapter implements ImageProviderAdapter {
     base: string,
     signal: AbortSignal,
   ): Promise<Response> {
-    const form = new FormData();
+    // Must be undici's own FormData: its fetch brand-checks the instance, and a
+    // global (Node-bundled) FormData is silently stringified to "[object FormData]".
+    const form = new UndiciFormData();
     form.append("model", req.modelId);
     form.append("prompt", req.prompt);
     form.append("n", String(req.n ?? 1));
@@ -223,9 +225,7 @@ export class OpenAIAdapter implements ImageProviderAdapter {
     return undiciFetch(`${base}/images/edits`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
-      // undici's BodyInit type predates the global FormData; the runtime
-      // duck-types it and multipart-encodes correctly.
-      body: form as unknown as import("undici").BodyInit,
+      body: form,
       signal,
       dispatcher,
     }) as unknown as Promise<Response>;
