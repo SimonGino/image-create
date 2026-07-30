@@ -22,6 +22,7 @@
     "react": "^19.2",
     "react-dom": "^19.2",
     "sharp": "^0.34",
+    "undici": "^8.9.0",
     "zod": "^4"
   },
   "devDependencies": {

@@ -10,6 +10,8 @@
  * provider by @/providers/validate — this file is only the call.
  */
 
+import { Agent, fetch as undiciFetch } from "undici";
+
 import { getProviderConfig } from "@/lib/credentials";
 import {
   AuthError,
@@ -32,6 +34,13 @@ import { OPENAI_MODELS } from "./models";
 
 const DEFAULT_OPENAI_BASE = "https://api.openai.com/v1";
 const REQUEST_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? 120_000);
+
+// Node's fetch (undici) has its own 300s headers/body timeouts that silently
+// cap any OPENAI_TIMEOUT_MS above them — slow edits (high quality, big sizes)
+// legitimately exceed 300s. Disable both so the AbortController below is the
+// single timeout authority. The Agent must be paired with the npm package's
+// own fetch: Node's bundled fetch speaks an older dispatcher-handler protocol.
+const dispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 /** Resolve the base URL: configured (proxy / relay / custom gateway) or official. */
 function resolveBaseUrl(baseUrl: string | undefined): string {
@@ -127,6 +136,15 @@ export class OpenAIAdapter implements ImageProviderAdapter {
           cause: err,
         });
       }
+      // undici wraps transport failures (connection reset, its own timeouts,
+      // TLS errors) in `TypeError: fetch failed` with the real error as cause.
+      if (err instanceof TypeError && err.message === "fetch failed") {
+        const cause = err.cause as { code?: string; message?: string } | undefined;
+        throw new ProviderError(
+          `OpenAI network failure${cause?.code ? ` (${cause.code})` : ""}: ${cause?.message ?? err.message}`,
+          { providerId: this.providerId, cause: err },
+        );
+      }
       throw err;
     } finally {
       clearTimeout(timeout);
@@ -161,12 +179,13 @@ export class OpenAIAdapter implements ImageProviderAdapter {
       ...(req.outputFormat ? { output_format: req.outputFormat } : {}),
       ...(req.providerParams ?? {}),
     };
-    return fetch(`${base}/images/generations`, {
+    return undiciFetch(`${base}/images/generations`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal,
-    });
+      dispatcher,
+    }) as unknown as Promise<Response>;
   }
 
   private callEdits(
@@ -201,11 +220,14 @@ export class OpenAIAdapter implements ImageProviderAdapter {
       form.append(key, typeof value === "string" ? value : String(value));
     }
 
-    return fetch(`${base}/images/edits`, {
+    return undiciFetch(`${base}/images/edits`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}` },
-      body: form,
+      // undici's BodyInit type predates the global FormData; the runtime
+      // duck-types it and multipart-encodes correctly.
+      body: form as unknown as import("undici").BodyInit,
       signal,
-    });
+      dispatcher,
+    }) as unknown as Promise<Response>;
   }
 }
